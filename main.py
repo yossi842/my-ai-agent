@@ -170,6 +170,31 @@ def chat(req: ChatRequest, provider: str = "") -> JSONResponse:
 
 
 # ============================================================ טלפוניה (Twilio)
+async def _read_form(request: Request) -> dict:
+    """קורא גוף בקשה מסוג application/x-www-form-urlencoded.
+
+    FastAPI משתמש ב-python-multipart לניתוח form, ואנו מתחזרים לשמור על
+    אפס תלויות. Twilio שולח urlencoded (לא multipart), ולכן מספיק לפרש
+    אותו ידנית. אם מגיע multipart - נתמוך בו גם כדי לא להפתע.
+    """
+    from urllib.parse import parse_qsl
+
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    ctype = request.headers.get("content-type", "").lower()
+
+    if "multipart/form-data" in ctype:
+        # ניסיון מינימלי: חילוץ שדות רגילים בלבד (Twilio לא משתמש בזה)
+        fields: dict[str, str] = {}
+        for chunk in raw.split("\r\n\r\n")[1::2]:
+            name, _, value = chunk.partition("\r\n")
+            m = re.search(r'name="([^"]+)"', name)
+            if m:
+                fields[m.group(1)] = value
+        return fields
+
+    return dict(parse_qsl(raw, keep_blank_values=True))
+
+
 @app.get("/voice/status", dependencies=[Depends(require_key)])
 def voice_status() -> dict:
     from voice import status_report
@@ -193,7 +218,7 @@ def _twilio_guard(request: Request, form: dict) -> None:
 async def voice_webhook(request: Request) -> Response:
     from voice import handle_voice_webhook, VOICE_ENABLED
 
-    form = dict(await request.form())
+    form = await _read_form(request)
     _twilio_guard(request, form)
     if not VOICE_ENABLED:
         return Response(_voice_off_twiml(), media_type="application/xml")
@@ -205,7 +230,7 @@ async def voice_webhook(request: Request) -> Response:
 async def voice_turn(request: Request) -> Response:
     from voice import handle_voice_turn, VOICE_ENABLED
 
-    form = dict(await request.form())
+    form = await _read_form(request)
     _twilio_guard(request, form)
     if not VOICE_ENABLED:
         return Response(_voice_off_twiml(), media_type="application/xml")
