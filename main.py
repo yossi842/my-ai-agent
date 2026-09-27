@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from agent import providers, run_agent_limited
+from stt import stt_backends as _stt_backends, transcribe as transcribe_audio
 from tools import TOOL_SCHEMAS, _load_notes
 
 VERSION = "3.0.0"
@@ -46,6 +47,7 @@ ALLOWED_ORIGINS = [
 ]
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20") or 20)
 MAX_CONCURRENT = int(os.getenv("AGENT_MAX_CONCURRENCY", "4") or 4)
+VOICE_BASE_URL = os.getenv("VOICE_BASE_URL", "").strip()
 
 # CORS: כברירת מחדל סגור לגמרי (same-origin בלבד). לפתיחה לדומיין חיצוני -
 # הגדר ALLOWED_ORIGINS=https://example.com
@@ -122,6 +124,8 @@ def info() -> dict:
         "agent_mode": True,
         "provider": f"{provs[0]['id']}:{provs[0]['model']}" if provs else "local",
         "providers_available": [p["id"] for p in provs],
+        "stt_backends": [b["id"] for b in _stt_backends()],
+        "voice_agent": os.getenv("VOICE_ENABLED", "0") in ("1", "true", "yes", "on"),
         "auth_required": bool(API_KEY),
         "cors_origins": ALLOWED_ORIGINS or "same-origin only",
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
@@ -132,12 +136,89 @@ def info() -> dict:
     }
 
 
+@app.post("/api/transcribe", dependencies=[Depends(rate_limit), Depends(require_key)])
+async def transcribe(request: Request) -> JSONResponse:
+    """ממיר שמע לטקסט. הגוף הוא קובץ השמע הגולמי, לא JSON."""
+    body = await request.body()
+    content_type = request.headers.get("content-type", "audio/webm")
+    language = request.headers.get("x-language", "he")
+    result = transcribe_audio(body, content_type, language)
+    return JSONResponse(status_code=200 if "error" not in result else 502, content=result)
+
+
+@app.get("/api/stt", dependencies=[Depends(require_key)])
+def stt_info() -> dict:
+    from stt import stt_backends
+    return {
+        "backends": [{"id": b["id"], "model": b["model"]} for b in stt_backends()],
+        "max_bytes": 8 * 1024 * 1024,
+        "note": "POST raw audio body to /api/transcribe",
+    }
+
+
 @app.post("/api/chat", dependencies=[Depends(rate_limit), Depends(require_key)])
-def chat(req: ChatRequest) -> JSONResponse:
+def chat(req: ChatRequest, provider: str = "") -> JSONResponse:
     session = req.clean_session()
-    result = run_agent_limited(goal=req.message, session_id=session)
+    only = provider.strip().lower() or None
+    if only and only not in ("groq", "openai", "gemini"):
+        raise HTTPException(status_code=400, detail="provider חייב להיות groq/openai/gemini")
+    result = run_agent_limited(
+        goal=req.message, session_id=session, provider_filter=only
+    )
     status = 200 if result.get("ok") else 503
     return JSONResponse(status_code=status, content=result)
+
+
+# ============================================================ טלפוניה (Twilio)
+@app.get("/voice/status", dependencies=[Depends(require_key)])
+def voice_status() -> dict:
+    from voice import status_report
+    return status_report()
+
+
+def _twilio_guard(request: Request, form: dict) -> None:
+    """מאמת חתימת Twilio. בלי זה, כל אחד יכול להפעיל את הסוכן בחינם."""
+    from voice import TWILIO_AUTH_TOKEN, verify_twilio_signature
+
+    if not TWILIO_AUTH_TOKEN:
+        return
+    base = VOICE_BASE_URL or str(request.base_url).rstrip("/")
+    url = f"{base}{request.url.path}"
+    sig = request.headers.get("x-twilio-signature", "")
+    if not verify_twilio_signature(url, form, sig, TWILIO_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Twilio signature invalid")
+
+
+@app.post("/voice/webhook")
+async def voice_webhook(request: Request) -> Response:
+    from voice import handle_voice_webhook, VOICE_ENABLED
+
+    form = dict(await request.form())
+    _twilio_guard(request, form)
+    if not VOICE_ENABLED:
+        return Response(_voice_off_twiml(), media_type="application/xml")
+    base = VOICE_BASE_URL or str(request.base_url).rstrip("/")
+    return Response(handle_voice_webhook(base, form), media_type="application/xml")
+
+
+@app.post("/voice/turn")
+async def voice_turn(request: Request) -> Response:
+    from voice import handle_voice_turn, VOICE_ENABLED
+
+    form = dict(await request.form())
+    _twilio_guard(request, form)
+    if not VOICE_ENABLED:
+        return Response(_voice_off_twiml(), media_type="application/xml")
+    base = VOICE_BASE_URL or str(request.base_url).rstrip("/")
+    return Response(handle_voice_turn(base, form), media_type="application/xml")
+
+
+def _voice_off_twiml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<Response>'
+        '<Say language="he-IL">שירות הטלפון כבוי כרגע.</Say>'
+        '<Hangup/></Response>'
+    )
 
 
 @app.get("/api/notes", dependencies=[Depends(require_key)])
@@ -235,13 +316,22 @@ h1{margin:0;font-size:19px;display:flex;align-items:center;gap:9px}
 .examples button{background:rgba(255,255,255,.08);border:1px solid var(--line);color:#e5e7eb;
   border-radius:18px;padding:7px 12px;cursor:pointer;font-size:13px}
 .examples button:hover{background:rgba(255,255,255,.16)}
-form{display:flex;gap:10px;padding:14px 20px;background:rgba(0,0,0,.28);border-top:1px solid var(--line)}
+form{display:flex;gap:10px;padding:14px 20px;background:rgba(0,0,0,.28);border-top:1px solid var(--line);align-items:center}
 input{flex:1;padding:12px 14px;border-radius:12px;border:1px solid var(--line);
   background:rgba(255,255,255,.07);color:#fff;font-size:15px;outline:none}
 input:focus{border-color:var(--accent)}
 button.send{background:var(--accent);border:none;color:#052e16;font-weight:700;border-radius:12px;
-  padding:0 22px;cursor:pointer;font-size:15px}
+  padding:0 20px;cursor:pointer;font-size:15px}
 button.send:disabled{opacity:.5;cursor:not-allowed}
+#mic{width:46px;height:46px;min-width:46px;border-radius:50%;border:1px solid var(--line);
+  background:rgba(255,255,255,.08);color:#e5e7eb;cursor:pointer;font-size:19px;line-height:1}
+#mic.rec{background:rgba(239,68,68,.85);border-color:#ef4444;animation:pulse 1.1s infinite}
+#mic:disabled{opacity:.4;cursor:not-allowed}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.7)}100%{box-shadow:0 0 0 14px rgba(239,68,68,0)}}
+#tts{width:46px;height:46px;min-width:46px;border-radius:50%;border:1px solid var(--line);
+  background:rgba(255,255,255,.08);color:#e5e7eb;cursor:pointer;font-size:17px;line-height:1}
+#tts.on{background:var(--accent);color:#052e16}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 .ghost{background:transparent;border:1px solid var(--line);color:#e5e7eb;border-radius:10px;
   padding:6px 11px;cursor:pointer;font-size:12px}
 .typing{opacity:.65}
@@ -266,7 +356,9 @@ footer{text-align:center;font-size:12px;opacity:.55;padding:9px}
   <button onclick="ask('מה שמרת ממני?')">מה זכרת</button>
 </div>
 <form onsubmit="send(event)">
-  <input id="inp" placeholder="כתוב משימה לסוכן…" autocomplete="off" maxlength="8000">
+  <button id="mic" type="button" title="הקלדה מדיבור (מיקרופון)" aria-label="הקלדה מדיבור">🎙️</button>
+  <input id="inp" placeholder="כתוב משימה לסוכן, או לחץ על המיקרופון ודבר…" autocomplete="off" maxlength="8000">
+  <button id="tts" type="button" title="הקרא את התשובות בקול" aria-label="הקרא תשובות בקול">🔊</button>
   <button class="send" id="btn" type="submit">שלח</button>
 </form>
 <footer id="foot">Render · Frankfurt · Free</footer>
@@ -303,12 +395,126 @@ add('היי! אני סוכן AI אוטונומי. אני יכול לחשב, לח
 function ask(t){inp.value=t; send(new Event('submit'));}
 function reset(){log.innerHTML='';history=[];add('נוקה. מה לעשות עכשיו?','bot');}
 
+/* ================= קלט קולי =================
+   מסלול 1 (מועדף): Web Speech API של הדפדפן - מקומי, מיידי, בחינם, תומך בעברית.
+   מסלול 2 (גיבוי): הקלטה דרך MediaRecorder + שליחה לשרת, שמתמלל
+   בעזרת whisper של Groq או gemini-transcribe. מתאים לדפדפנים בלי Web Speech
+   (Firefox, Safari) ולמכשירים ניידים. */
+const mic=document.getElementById('mic'), ttsBtn=document.getElementById('tts');
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let rec=null, recActive=false, mr=null, mrChunks=[];
+
+function stopSpeech(){
+  if(rec){ try{rec.stop()}catch(e){} }
+  if(mr&&mr.state!=='inactive'){ try{mr.stop()}catch(e){} }
+  mic.classList.remove('rec'); mic.textContent='🎙️'; recActive=false;
+}
+mic.addEventListener('click',()=>{ recActive?stopSpeech():startListening(); });
+
+function startListening(){
+  if(SR){ startWebSpeech(); } else { startRecorder(); }
+}
+
+function startWebSpeech(){
+  rec=new SR();
+  rec.lang='he-IL'; rec.interimResults=true; rec.continuous=false; rec.maxAlternatives=1;
+  recActive=true; mic.classList.add('rec'); mic.textContent='⏹️';
+  let base=inp.value.trim()?inp.value.trim()+' ':'';
+  rec.onresult=e=>{
+    let final='',interim='';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const t=e.results[i][0].transcript;
+      e.results[i].isFinal?final+=t:interim+=t;
+    }
+    inp.value=base+(final||interim);
+    if(final){ stopSpeech(); inp.focus(); }
+  };
+  rec.onerror=e=>{
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){
+      add('אין הרשאה למיקרופון. אפשר לחלופין להקליד או להשתמש בהקלטה.','err');
+      stopSpeech();
+    } else if(e.error!=='aborted' && e.error!=='no-speech'){
+      add('בעיית זיהוי דיבור: '+e.error,'err'); stopSpeech();
+    }
+  };
+  rec.onend=()=>{ if(recActive) stopSpeech(); };
+  try{ rec.start(); }catch(e){ stopSpeech(); }
+}
+
+async function startRecorder(){
+  if(!navigator.mediaDevices||!window.MediaRecorder){
+    add('הדפדפן הזה לא תומך בהקלטה. אפשר להשתמש בדפדפן Chrome או Edge.','err');
+    return;
+  }
+  let stream;
+  try{ stream=await navigator.mediaDevices.getUserMedia({audio:true}); }
+  catch(e){ add('אין הרשאה למיקרופון.','err'); return; }
+  mrChunks=[];
+  try{ mr=new MediaRecorder(stream); } catch(e){ add('הקלטה לא נתמכה בדפדפן הזה.','err'); return; }
+  mr.ondataavailable=e=>{ if(e.data && e.data.size) mrChunks.push(e.data); };
+  mr.onstop=async()=>{
+    stream.getTracks().forEach(t=>t.stop());
+    const blob=new Blob(mrChunks,{type:mr.mimeType||'audio/webm'});
+    stopSpeech();
+    if(blob.size<1200){ add('לא הקלטתי כלום.','err'); return; }
+    add('מתמלל…','bot typing');
+    const pending=log.lastElementChild;
+    try{
+      const headers={'Content-Type':blob.type};
+      if(KEY) headers['X-API-Key']=KEY;
+      const r=await fetch('/api/transcribe',{method:'POST',headers,body:blob});
+      const j=await r.json();
+      pending.remove();
+      if(j.error){ add('תמלול נכשל: '+j.error,'err'); return; }
+      const said=(j.text||'').trim();
+      if(!said){ add('לא הצלחתי לזהות דיבור.','err'); return; }
+      inp.value=said;
+      add('🎤 '+said,'user'); history.push({role:'user',content:said});
+      await submitText(said);
+    }catch(err){
+      pending.remove();
+      add('שגיאה בתמלול.','err');
+    }
+  };
+  mr.start();
+  recActive=true; mic.classList.add('rec'); mic.textContent='⏹️';
+}
+
+/* ================= הקראה קולית ================= */
+let ttsOn=localStorage.getItem('agent_tts')==='1';
+function applyTts(){
+  ttsBtn.classList.toggle('on',ttsOn);
+  ttsBtn.textContent=ttsOn?'🔊':'🔇';
+  ttsBtn.title=ttsOn?'הקראה קולית פעילה':'הקראה קולית כבויה';
+}
+applyTts();
+ttsBtn.addEventListener('click',()=>{
+  ttsOn=!ttsOn; localStorage.setItem('agent_tts',ttsOn?'1':'0'); applyTts();
+  if(!ttsOn && window.speechSynthesis) window.speechSynthesis.cancel();
+});
+function speak(text){
+  if(!ttsOn||!window.speechSynthesis) return;
+  try{
+    window.speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(text);
+    u.lang='he-IL'; u.rate=1.02;
+    const vs=window.speechSynthesis.getVoices();
+    const he=vs.find(v=>/^he([-_]|$)/i.test(v.lang));
+    if(he) u.voice=he;
+    window.speechSynthesis.speak(u);
+  }catch(e){}
+}
+
 async function send(e){
   e.preventDefault();
   const text=inp.value.trim();
   if(!text) return;
   inp.value=''; add(text,'user');
   history.push({role:'user',content:text});
+  await submitText(text);
+}
+
+async function submitText(text){
   const typing=add('מקליד…','bot typing');
   btn.disabled=true;
   const t0=performance.now();
@@ -333,6 +539,7 @@ async function send(e){
         +(j.used_tools?' · עם כלים':'');
       const s=document.createElement('span'); s.className='prov'; s.textContent=tag; typing.appendChild(s);
       history.push({role:'assistant',content:j.answer||''});
+      speak(j.answer||'');
     }
   }catch(err){
     typing.className='msg err'; typing.textContent='שגיאת חיבור לשרת. נסה שוב.';
