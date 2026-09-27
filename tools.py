@@ -388,6 +388,15 @@ HANDLERS = {
     "forget": _t_forget,
 }
 
+# כלי האינטרנט (חיפוש, קריאה, דפדפן) מגיעים מ-module נפרד כדי לשמור על קובץ קריא
+try:
+    from webtools import WEB_HANDLERS, WEB_SCHEMAS
+    HANDLERS.update(WEB_HANDLERS)
+    TOOL_SCHEMAS = TOOL_SCHEMAS + WEB_SCHEMAS
+except Exception as _e:  # pragma: no cover - אינטרנט אינו חובה לשאר הכלים
+    import sys
+    print(f"[tools] webtools לא נטען: {_e}", file=sys.stderr)
+
 
 def run_tool(name: str, args: dict) -> dict:
     handler = HANDLERS.get(name)
