@@ -152,19 +152,33 @@ def models() -> dict:
     from urllib.error import HTTPError
     from urllib.request import Request as URLRequest, urlopen
 
+    from agent import BROWSER_UA
+
     out = []
     for p in providers():
-        entry = {"provider": p["id"], "configured_model": p["model"], "available": [], "error": None}
+        entry = {
+            "provider": p["id"],
+            "configured_model": p["model"],
+            "available": [],
+            "error": None,
+        }
         try:
             req = URLRequest(
                 p["base_url"].rstrip("/") + "/models",
-                headers={"Authorization": f"Bearer {p['api_key']}"},
+                headers={
+                    "Authorization": f"Bearer {p['api_key']}",
+                    "Accept": "application/json",
+                    "User-Agent": BROWSER_UA,
+                },
             )
             with urlopen(req, timeout=20) as resp:
                 data = _json.loads(resp.read().decode())
             entry["available"] = sorted(m.get("id", "") for m in data.get("data", []))
         except HTTPError as e:
-            entry["error"] = f"HTTP {e.code}"
+            try:
+                entry["error"] = f"HTTP {e.code}: " + e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                entry["error"] = f"HTTP {e.code}"
         except Exception as e:
             entry["error"] = f"{type(e).__name__}: {e}"
         out.append(entry)
