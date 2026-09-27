@@ -49,3 +49,19 @@ services:
         value: "12"
       - key: AGENT_SYSTEM_PROMPT
         sync: false
+
+      # ===== סוכן קולי בטלפון (Twilio) =====
+      - key: VOICE_ENABLED
+        value: "0"          # הפעל רק אחרי שהגדרת Twilio
+      - key: TWILIO_AUTH_TOKEN
+        sync: false         # מאמת חתימות - חובה!
+      - key: VOICE_BASE_URL
+        sync: false         # https://my-ai-agent-wpuz.onrender.com
+      - key: VOICE_GREETING
+        sync: false
+      - key: VOICE_VOICE
+        value: Google.he-IL-Wavenet-A
+      - key: VOICE_MAX_TURNS
+        value: "12"
+      - key: STT_MODEL
+        value: whisper-large-v3
