@@ -41,6 +41,19 @@ def _int_env(name: str, default: int) -> int:
 
 
 # ------------------------------------------------------------- provider list
+#
+# מודלי גיבוי למקרה שהמודל המוגדר לא קיים / אינו זמין למפתח.
+# Groq מסיר מודלים מהקטלוג מדי פעם, ואז מתקבל 404 במקום תשובה.
+MODEL_FALLBACKS = {
+    "groq": [
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.8-27b",
+        "openai/gpt-oss-20b",
+        "allam-2-7b",
+    ],
+}
+
+
 def providers() -> List[Dict[str, str]]:
     """מחזיר את ספקי המודל הזמינים לפי סדר עדיפות."""
     out: List[Dict[str, str]] = []
@@ -49,8 +62,8 @@ def providers() -> List[Dict[str, str]]:
             "id": "groq",
             "base_url": "https://api.groq.com/openai/v1",
             "api_key": os.environ["GROQ_API_KEY"].strip(),
-            "model": (os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
-                      or "llama-3.3-70b-versatile"),
+            "model": (os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+                      or "openai/gpt-oss-120b"),
         })
     if os.getenv("OPENAI_API_KEY", "").strip():
         out.append({
@@ -67,6 +80,17 @@ def providers() -> List[Dict[str, str]]:
             "api_key": gem,
             "model": (os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"),
         })
+    return out
+
+
+def provider_variants() -> List[Dict[str, str]]:
+    """כל הזוגות (ספק, מודל) לניסיון: המודל המוגדר ואחריו מודלי הגיבוי."""
+    out: List[Dict[str, str]] = []
+    for p in providers():
+        out.append(p)
+        for model in MODEL_FALLBACKS.get(p["id"], []):
+            if model != p["model"]:
+                out.append({**p, "model": model})
     return out
 
 
@@ -229,7 +253,7 @@ def run_agent(
     answer = ""
     last_errors: List[str] = []
 
-    for provider in provs:
+    for provider in provider_variants():
         convo = list(history)
         try:
             for step in range(1, max_steps + 1):
@@ -239,7 +263,7 @@ def run_agent(
                 try:
                     raw = _chat_once(provider, convo, TOOL_SCHEMAS if use_tools else [], timeout)
                 except Exception as e:
-                    last_errors.append(f"{provider['id']}: {e}")
+                    last_errors.append(f"{provider['id']}/{provider['model']}: {e}")
                     break
 
                 choice = (raw.get("choices") or [{}])[0]
