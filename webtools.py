@@ -187,6 +187,22 @@ def _t_web_search(query: str = "", limit: int = 8) -> Dict[str, Any]:
 
 
 # ============================================================ 2) fetch_page
+def _encode_url(url: str) -> str:
+    """מקודד URL ל-ASCII.
+
+    ⚠️ urlopen דורש ASCII בלבד. כתובות עם עברית/רוסית גורמות ל-
+    UnicodeEncodeError. זה באג שכבר הופיע פעם בעבר וחזר כאן כי הלוגיקה
+    שוכפלה - לכן כל נתיב HTTP עובר כאן דרך מקום אחד.
+    """
+    from urllib.parse import quote
+    if url.isascii():
+        return url
+    p = urlparse(url)
+    return (f"{p.scheme}://{p.netloc}{quote(p.path, safe='/%:@!$&()*+,;=~')}"
+            f"{('?' + quote(p.query, safe='=&%:@!$()*+,;/?~')) if p.query else ''}"
+            f"{('#' + quote(p.fragment, safe='=&%:@!$()*+,;/?~')) if p.fragment else ''}")
+
+
 def _t_fetch_page(url: str = "", maxChars: int = MAX_FETCH_CHARS) -> Dict[str, Any]:
     """הורד דף וחלץ ממנו טקסט קריא. מהיר יותר מדפדפן, ועובד ברוב האתרים."""
     url = (url or "").strip()
@@ -195,7 +211,11 @@ def _t_fetch_page(url: str = "", maxChars: int = MAX_FETCH_CHARS) -> Dict[str, A
     if not url.startswith(("http://", "https://")):
         return {"error": "רק http/https מותרים"}
     try:
-        raw = _get(url, timeout=25)
+        target = _encode_url(url)
+    except Exception as e:
+        return {"url": url, "error": f"לא ניתן לקרוא את הכתובת: {e}"}
+    try:
+        raw = _get(target, timeout=25)
     except HTTPError as e:
         return {"url": url, "error": f"HTTP {e.code}",
                 "hint": "אם זה אתר עם JS כבד, נסה את הכלי browser_open"}
