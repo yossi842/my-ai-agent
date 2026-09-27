@@ -19,6 +19,10 @@ from urllib.request import Request as URLRequest, urlopen
 from tools import TOOL_SCHEMAS, quick_reply, run_tool
 
 ISRAEL_TZ_OFFSET = 3
+BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 DEFAULT_SYSTEM_PROMPT = (
     "אתה סוכן AI ידידותי ומקצועי, עונה תמיד בעברית אלא אם המשתמש ביקש אחרת.\n"
     "- ענה קצר וממוקד, בלי מילות מיותרות ובלי התנצלות.\n"
@@ -72,19 +76,29 @@ def active_provider() -> str:
 
 
 # ------------------------------------------------------------------ transport
+def _api_headers(api_key: str) -> dict:
+    """כותרות הבקשה.
+
+    חשוב: urllib שולח User-Agent כמו 'Python-urllib/3.x'. מאחורי חלק מהספקים
+    (Groq למשל) יושבת Cloudflare עם Browser Integrity Check שמחזיר
+    403 "error code: 1010" לכל User-Agent שאינו דפדפן. לכן אנחנו מציגים
+    עצמנו כלקוח רגיל.
+    """
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
 def _post_json(url: str, payload: dict, api_key: str, timeout: int) -> dict:
     """שולח בקשה ל-API תואם OpenAI. ממיר שגיאות HTTP להודעה קריאה."""
     from urllib.error import HTTPError, URLError
 
     body = json.dumps(payload).encode()
-    req = URLRequest(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
+    req = URLRequest(url, data=body, headers=_api_headers(api_key))
     try:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
