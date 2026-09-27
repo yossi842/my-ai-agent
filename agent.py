@@ -204,6 +204,23 @@ def _save_history(session_id: str, messages: List[dict], max_sessions: int = 100
 
 
 # ------------------------------------------------------------------ the loop
+def _fallback_answer(steps: List[dict]) -> str:
+    """תשובת חירום כשהמודל סיים בלי להפיק טקסט — מציג את מה שהכלים מצאו."""
+    if not steps:
+        return "לא הצלחתי להפיק תשובה. נסה לנסח את השאלה אחרת."
+    lines = ["ביצעתי את הפעולה, אבל לא הצלחתי לנסח תשובה מלאה:"]
+    for step in steps[-3:]:
+        result = step.get("result")
+        if isinstance(result, dict):
+            if result.get("error"):
+                lines.append(f"- {step['tool']}: {result['error']}")
+                continue
+            facts = {k: v for k, v in result.items() if k not in ("error",)}
+            text = json.dumps(facts, ensure_ascii=False)
+            lines.append(f"- {step['tool']}: {text[:300]}")
+    return "\n".join(lines)
+
+
 def run_agent(
     goal: str,
     session_id: str = "default",
@@ -272,10 +289,22 @@ def run_agent(
 
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
-                    answer = (msg.get("content") or "").strip()
-                    emit({"type": "final", "content": answer})
-                    if not answer:
-                        answer = "לא הצלחתי להפיק תשובה. נסה לנסח את השאלה אחרת."
+                    text = (msg.get("content") or "").strip()
+                    if not text:
+                        # מודלים מסוג gpt-oss מחזירים לעיתים content ריק אחרי
+                        # הרצת כלי. במקום להפסיד, נדרוש תשובה מפורשת ונמשיך.
+                        if step < max_steps and used_tools:
+                            convo.append({
+                                "role": "user",
+                                "content": "עכשיו ענה למשתמש בעברית בקצרה. "
+                                           "אל תקרא לכלים נוספים.",
+                            })
+                            continue
+                        answer = _fallback_answer(steps)
+                        emit({"type": "final", "content": answer})
+                        break
+                    answer = text
+                    emit({"type": "final", "content": text})
                     break
 
                 used_tools = True
