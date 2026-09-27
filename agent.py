@@ -90,18 +90,32 @@ MODEL_FALLBACKS = {
         "openai/gpt-oss-20b",
     ],
     "gemini": [
-        "gemini-3.8-flash",
         "gemini-3.5-flash",
         "gemini-3.7-flash",
         "gemini-2.5-flash",
-        "gemini-3.8-flash-lite",
+        "gemini-3.5-flash-lite",
     ],
 }
 
 
 def providers() -> List[Dict[str, str]]:
-    """מחזיר את ספקי המודל הזמינים לפי סדר עדיפות."""
+    """רשימת הספקים לפי סדר עדיפות.
+
+    ⚠️ סדר זה נבדק בהשוואה, לא נבחר אקראית. באותה שאלה זהה:
+      Gemini 3.5 Flash  -> תשובה נכונה ומדויקת בעברית
+      gpt-oss-120b     -> איבד את ההקשר, לא סיכם תשובה
+      gpt-oss-20b      -> "פרטים לא נמצאו" למרות 119K תווים בהקשר
+    לכן Gemini ראשון, ו-Groq כגיבוי (מהיר, אך חלש בעברית ארוכה).
+    """
     out: List[Dict[str, str]] = []
+    gem = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if gem:
+        out.append({
+            "id": "gemini",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "api_key": gem,
+            "model": (os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"),
+        })
     if os.getenv("GROQ_API_KEY", "").strip():
         out.append({
             "id": "groq",
@@ -116,14 +130,6 @@ def providers() -> List[Dict[str, str]]:
             "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip(),
             "api_key": os.environ["OPENAI_API_KEY"].strip(),
             "model": (os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"),
-        })
-    gem = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-    if gem:
-        out.append({
-            "id": "gemini",
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "api_key": gem,
-            "model": (os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"),
         })
     return out
 
