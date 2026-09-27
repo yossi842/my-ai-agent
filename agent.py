@@ -65,6 +65,8 @@ TOOL_PRIORITY_RULES = (
     "4. לעולם אל תחפש דרך דפדפן. חיפוש דרך דפדפן נחסם על ידי CAPTCHA.\n"
     "5. אם כלי דפדפן מחזיר error או hint - חזור מיד ל-fetch_page, אל תנסה שוב.\n"
     "6. בסיום משימת גלישה קרא ל-browser_close כדי לשחרר זיכרון.\n"
+    "7. אל תבזבז זמן על חיפושים חוזרים: אחרי 2 חיפושים שלא הניבו "
+    "תשובה, עצור וענה מהידעתך או אמר שאינך יודע.\n"
 )
 
 def _int_env(name: str, default: int) -> int:
@@ -307,7 +309,9 @@ def run_agent(
         )
 
     max_steps = _int_env("AGENT_MAX_STEPS", 8)
-    timeout = _int_env("AGENT_TIMEOUT", 90)
+    # גבוה מהרשת הרגילה: קריאת דפדפן יכולה לקחת 80 שניות כשהשרת
+    # ישן, ובלי מספיק זמן הסוכן נחתך באמצע משימה תקינה.
+    timeout = _int_env("AGENT_TIMEOUT", 200)
     use_tools = os.getenv("AGENT_TOOLS", "1").strip() not in ("0", "false", "no")
 
     system_prompt = ((os.getenv("AGENT_SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT)
