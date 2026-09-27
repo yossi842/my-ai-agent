@@ -96,6 +96,28 @@ def _wikipedia_search(query: str, limit: int = 5) -> List[dict]:
             for h in data.get("query", {}).get("search", [])]
 
 
+def _mojeek(query: str) -> List[dict]:
+    """Mojeek - מנוע חיפוש עצמאי וקטן, נאנה לבוטים (רישיון ציבורי לשימוש).
+
+    נוסף כיוצא ממדידה: DuckDuckGo חוסם כתובות-IP של data center
+    (כפי שנראה גם בדפדפן - CAPTCHA). Mojeek מאפשר גישה תכנותית.
+    """
+    doc = _get("https://www.mojeek.com/search?q=" + quote_plus(query), timeout=20)
+    results: List[dict] = []
+    for m in re.finditer(r'<a[^>]+class="ob"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', doc, re.I | re.S):
+        href, title = m.group(1), _clean_text(m.group(2))
+        if href.startswith("http") and title:
+            results.append({"title": title[:160], "url": href})
+        if len(results) >= 10:
+            break
+    if not results:
+        for m in re.finditer(r'<h2><a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>', doc, re.I | re.S):
+            results.append({"title": _clean_text(m.group(2))[:160], "url": m.group(1)})
+            if len(results) >= 10:
+                break
+    return results
+
+
 def _t_web_search(query: str = "", limit: int = 8) -> Dict[str, Any]:
     """חפש באינטרנט. מוחזר רשימת תוצאות עם כותרת, כתובת ותקציר."""
     query = (query or "").strip()
@@ -104,7 +126,13 @@ def _t_web_search(query: str = "", limit: int = 8) -> Dict[str, Any]:
     limit = max(1, min(int(limit or 8), 15))
     errors = []
 
-    for name, fn in (("duckduckgo", _ddg), ("wikipedia", lambda q: _wikipedia_search(q, limit))):
+    # סדר העדפה: Mojeek (לא חוסם) -> DuckDuckGo -> Wikipedia
+    engines = (
+        ("mojeek", _mojeek),
+        ("duckduckgo", _ddg),
+        ("wikipedia", lambda q: _wikipedia_search(q, limit)),
+    )
+    for name, fn in engines:
         try:
             res = fn(query)
             if res:
