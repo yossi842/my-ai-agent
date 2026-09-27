@@ -25,7 +25,7 @@
 | משתנה | ברירת מחדל | תיאור |
 |---|---|---|
 | `GROQ_API_KEY` | — | **מומלץ.** חינם, בלי כרטיס — [console.groq.com/keys](https://console.groq.com/keys) |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | |
 | `GEMINI_API_KEY` | — | חלופה |
 | `GEMINI_MODEL` | `gemini-2.0-flash` | |
 | `OPENAI_API_KEY` | — | חלופה |
@@ -43,6 +43,24 @@
 
 סדר עדיפות הספקים: **Groq → OpenAI → Gemini**. אם אחד נכשל, עוברים לבא.
 
+### למה יש כאן `User-Agent` של דפדפן
+
+`urllib` של Python שולח `User-Agent: Python-urllib/3.x`. מאחורי `api.groq.com` יושבת Cloudflare עם
+**Browser Integrity Check** שחוסם כל `User-Agent` שאינו דפדפן ומחזיר:
+
+```
+HTTP 403: error code: 1010
+```
+
+זה נראה בדיוק כמו מפתח לא תקין, אבל זו לא הבעיה — הפתרון הוא להציג עצמנו כלקוח רגיל
+(ראה `_api_headers` ב-`agent.py`).
+
+### למה יש רשימת מודלי גיבוי
+
+Groq מוציא מודלים מהקטלוג מדי פעם. `llama-3.3-70b-versatile` — שהיה ברירת המחדל הישנה — הוסר,
+ואז כל בקשה החזירה `404 ... does not exist`. לכן `MODEL_FALLBACKS` ב-`agent.py` מנסה מודלים
+אחרים אוטומטית. `GET /api/models` מחזיר את המודלים שהמפתח שלך רשאי להשתמש בהם.
+
 ## API
 
 | נתיב | שיטה | תיאור |
@@ -50,6 +68,7 @@
 | `/` | GET | ממשק צ'אט |
 | `/healthz` | GET/HEAD | בדיקת חיים |
 | `/api/info` | GET | ספק פעיל, כלים, מצב |
+| `/api/models` | GET | אילו מודלים המפתח רשאי להשתמש בהם (אבחון) |
 | `/api/chat` | POST | `{"message":"...","sessionId":"s1"}` |
 | `/api/notes` | GET | הזיכרון הקבוע |
 | `/api/history?sessionId=s1` | GET | היסטוריית שיחה |
