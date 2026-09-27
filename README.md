@@ -43,6 +43,69 @@
 
 סדר עדיפות הספקים: **Groq → OpenAI → Gemini**. אם אחד נכשל, עוברים לבא.
 
+## סוכן קולי בטלפון (Twilio)
+
+השרת יכול לקבל שיחות טלפון ולנהל אותן בקול מלא בעברית.
+
+### ⚠️ המלכודת הגדולה ביותר בעברית
+
+| פעולה | קוד שפה **נכון** | מה קורה אם כותבים `he-IL` במקום |
+|---|---|---|
+| הקראה קולית `<Say>` | `he-IL` | — |
+| זיהוי דיבור `<Gather>` | **`iw-IL`** | Warning 13331 → הטקסט חוזר **באנגלית**, בלי שגיאה גלויה |
+
+בנוסף: **עברית אינה נתמכת ב-Google STT v2**, ולכן אין להגדיר `speechModel="google_v2"`.
+
+קולות עברית זמינים:
+`Google.he-IL-Wavenet-A` (נקבה) · `Google.he-IL-Wavenet-B` (זכר) · `Google.he-IL-Standard-A/B/C/D` (רגיל, זול יותר)
+
+### הגדרה
+
+1. חשבון ב-[twilio.com](https://www.twilio.com) → קנה מספר ישראלי (או השתמש ב-`+15005550006` לבדיקות)
+2. העתק את `Account SID` ואת `Auth Token`
+3. ב-Render הוסף:
+   - `VOICE_ENABLED` = `1`
+   - `TWILIO_AUTH_TOKEN` = ה-Auth Token
+   - `VOICE_BASE_URL` = `https://my-ai-agent-wpuz.onrender.com`
+4. ב-Twilio Console → Phone Numbers → המספר שלך → **A Call Comes In** → Webhook:
+   `https://my-ai-agent-wpuz.onrender.com/voice/webhook` (POST)
+5. השתמש ב-HTTP POST בלבד — החתימה נבדקת מול `X-Twilio-Signature`
+
+### משתנים
+
+| משתנה | ברירת מחדל | תיאור |
+|---|---|---|
+| `VOICE_ENABLED` | `0` | הפעלת הסוכן הקולי |
+| `TWILIO_AUTH_TOKEN` | — | **חובה** לאימות חתימות |
+| `VOICE_BASE_URL` | — | כתובת השרת הציבורית |
+| `VOICE_GREETING` | `שלום, אני הסוכן שלך. איך אפשר לעזור?` | בריכה |
+| `VOICE_VOICE` | `Google.he-IL-Wavenet-A` | קול |
+| `VOICE_LANG` | `he-IL` | שפת ההקראה |
+| `VOICE_STT_LANG` | `iw-IL` | שפת זיהוי הדיבור |
+| `VOICE_MAX_TURNS` | `12` | מקסימום תורות בשיחה |
+| `VOICE_MAX_SAY_CHARS` | `450` | אורך מקסימלי לתשובה קולית |
+
+### עלות — לא חינם
+
+| רכיב | מחיר |
+|---|---|
+| שיחה למספר ישראלי | ≈ $0.01 לדקה |
+| זיהוי דיבור (`<Gather>`) | מחויב בנפרד לדקת דיבור |
+| הקראה קולית | חינמית בקולות בסיסיים, בתשלום בנוירליים |
+
+**השרת עצמו נשאר חינמי** — העלות היא רק על השיחה עצמה.
+
+### הזרימה
+
+```
+חיוג → /voice/webhook → <Say> בריכה → <Gather input="speech" language="iw-IL">
+      → /voice/turn  ← SpeechResult (טקסט עברי)
+      → הסוכן חושב (עם כלים) → <Say> התשובה → <Gather> שוב
+      → עד VOICE_MAX_TURNS → נפרד → <Hangup>
+```
+
+`GET /voice/status` מחזיר את מצב שכבת הטלפוניה.
+
 ### למה יש כאן `User-Agent` של דפדפן
 
 `urllib` של Python שולח `User-Agent: Python-urllib/3.x`. מאחורי `api.groq.com` יושבת Cloudflare עם
@@ -69,6 +132,11 @@ Groq מוציא מודלים מהקטלוג מדי פעם. `llama-3.3-70b-versat
 | `/healthz` | GET/HEAD | בדיקת חיים |
 | `/api/info` | GET | ספק פעיל, כלים, מצב |
 | `/api/models` | GET | אילו מודלים המפתח רשאי להשתמש בהם (אבחון) |
+| `/api/transcribe` | POST | שמע → טקסט (גוף בקשה = קובץ שמע גולמי) |
+| `/api/stt` | GET | אילו מנועי תמלול זמינים |
+| `/voice/webhook` | POST | כניסת שיחה מ-Twilio |
+| `/voice/turn` | POST | כל תור בשיחה |
+| `/voice/status` | GET | מצב שכבת הטלפון |
 | `/api/chat` | POST | `{"message":"...","sessionId":"s1"}` |
 | `/api/notes` | GET | הזיכרון הקבוע |
 | `/api/history?sessionId=s1` | GET | היסטוריית שיחה |
