@@ -12,12 +12,13 @@ import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import quote_plus, urlparse
 from urllib.request import Request as URLRequest, urlopen
 
 ISRAEL_TZ = timezone(timedelta(hours=3))
-UA = "my-ai-agent/3.0 (+render)"
+# Wikimedia דורש User-Agent מתאר עם פרטי יציר קשר, ומגביל קצב אגרסיבי.
+UA = "my-ai-agent/3.0 (https://github.com/yossi842/my-ai-agent; Hebrew AI agent) Python-urllib"
 MAX_TOOL_BYTES = 6000
 _MEM_LOCK = threading.Lock()
 
@@ -203,40 +204,88 @@ def _t_calculate_from_text(text: str = "", **_: Any) -> Dict[str, Any]:
     return {"text": text, "result": out, "solved": out is not None}
 
 
-def _t_wikipedia_search(query: str = "", limit: int = 5, **_: Any) -> Dict[str, Any]:
-    if not query.strip():
-        return {"error": "חסר query"}
-    limit = max(1, min(int(limit or 5), 10))
+def _wiki_api(host: str, params: str, tries: int = 2) -> dict:
+    """קורא ל-API של וויקיפדיה ומבחיל שגיאה במקום להחזיר תוצאה ריקה.
+
+    חשוב: Wikimedia מגביל קצב אגרסיבי ומחזיר 429. אם נבלבל בין 429 ל"לא
+    נמצא דבר", הסוכן יסיק שהערך לא קיים וינכשל — לכן כל שגיאה מדווחת.
+    """
+    from urllib.error import HTTPError
+
+    url = f"https://{host}/w/api.php?{params}"
+    last = "unknown error"
+    for attempt in range(tries):
+        try:
+            return json.loads(_http(url, timeout=20))
+        except HTTPError as e:
+            if e.code == 429:
+                last = "rate limited by Wikimedia (HTTP 429) - try again later"
+                continue
+            return {"_error": f"HTTP {e.code}"}
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+    raise RuntimeError(last)
+
+
+def _wiki_search_host(host: str, query: str, limit: int) -> dict:
     api = (
-        "https://he.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit="
-        f"{limit}&srsearch={quote_plus(query)}"
+        f"https://{host}/w/api.php?action=query&list=search&format=json"
+        f"&srlimit={limit}&srnamespace=0&srsearch={quote_plus(query)}"
     )
-    try:
-        data = json.loads(_http(api))
-    except Exception as e:
-        return {"error": f"חיפוש נכשל: {e}"}
+    data = _wiki_api(host, api.split("?", 1)[1])
+    if "_error" in data:
+        raise RuntimeError(data["_error"])
     hits = [
         {"title": h.get("title"), "snippet": re.sub(r"<[^>]+>", "", h.get("snippet", ""))}
         for h in data.get("query", {}).get("search", [])
     ]
-    return {"query": query, "results": hits, "count": len(hits)}
+    return {"wiki": host.split(".")[0], "results": hits, "count": len(hits)}
+
+
+def _t_wikipedia_search(query: str = "", limit: int = 5, **_: Any) -> Dict[str, Any]:
+    """מחפש בוויקיפדיה העברית, ואם אין תוצאות - גם באנגלית."""
+    query = (query or "").strip()
+    if not query:
+        return {"error": "חסר query"}
+    limit = max(1, min(int(limit or 5), 10))
+    try:
+        res = _wiki_search_host("he.wikipedia.org", query, limit)
+        if res["count"]:
+            res["query"] = query
+            return res
+        english = _wiki_search_host("en.wikipedia.org", query, limit)
+        english["query"] = query
+        english["note"] = "לא נמצא בוויקיפדיה העברית, התוצאות מהאנגלית"
+        return english
+    except RuntimeError as e:
+        return {"error": str(e), "query": query, "results": [], "count": 0}
 
 
 def _t_wikipedia_page(title: str = "", **_: Any) -> Dict[str, Any]:
-    if not title.strip():
+    title = (title or "").strip()
+    if not title:
         return {"error": "חסר title"}
-    api = (
-        "https://he.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1"
-        f"&explaintext=1&redirects=1&format=json&titles={quote_plus(title)}"
-    )
-    try:
-        data = json.loads(_http(api))
-    except Exception as e:
-        return {"error": f"שליפה נכשלה: {e}"}
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        return {"title": page.get("title"), "extract": (page.get("extract") or "")[:4000]}
-    return {"error": "הערך לא נמצא"}
+
+    def fetch(host: str, name: str) -> Optional[dict]:
+        params = (
+            "action=query&prop=extracts&exintro=1&explaintext=1"
+            f"&redirects=1&format=json&titles={quote_plus(name)}"
+        )
+        try:
+            data = _wiki_api(host, params)
+        except RuntimeError as e:
+            raise
+        for page in data.get("query", {}).get("pages", {}).values():
+            if page.get("extract"):
+                return {"title": page.get("title"), "extract": page["extract"][:4000]}
+        return None
+
+    for host in ("he.wikipedia.org", "en.wikipedia.org"):
+        found = fetch(host, title)
+        if found:
+            found["wiki"] = host.split(".")[0]
+            return found
+    return {"error": f"הערך לא נמצא: {title}"}
 
 
 def _t_read_url(url: str = "", **_: Any) -> Dict[str, Any]:
@@ -292,7 +341,7 @@ TOOL_SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "expression": {"type": "string", "description": "למשל (2+3)*4^2 או sqrt(144)"}}, "required": ["expression"]}}},
     {"type": "function", "function": {
-        "name": "wikipedia_search", "description": "חפש בוויקיפדיה העברית וקבל רשימת ערכים רלוונטיים.",
+        "name": "wikipedia_search", "description": "חפש בוויקיפדיה (עברית, ואם אין תוצאות גם באנגלית) וקבל רשימת ערכים. אם מתקבל error על כך שיש הגבלת קצב, חכה וענה בעצמך או אמר למשתמש.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"}, "limit": {"type": "integer", "description": "1-10, ברירת מחדל 5"}}, "required": ["query"]}}},
     {"type": "function", "function": {
