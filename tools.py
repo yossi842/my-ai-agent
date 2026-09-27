@@ -13,7 +13,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote, quote_plus, urlparse
 from urllib.request import Request as URLRequest, urlopen
 
 ISRAEL_TZ = timezone(timedelta(hours=3))
@@ -255,7 +255,11 @@ def _t_wikipedia_search(query: str = "", limit: int = 5, **_: Any) -> Dict[str, 
             return res
         english = _wiki_search_host("en.wikipedia.org", query, limit)
         english["query"] = query
-        english["note"] = "לא נמצא בוויקיפדיה העברית, התוצאות מהאנגלית"
+        english["note"] = (
+            "לא נמצאו תוצאות בוויקיפדיה העברית"
+            if english["count"] else
+            "לא נמצאו תוצאות בוויקיפדיה העברית ולא באנגלית - אפשר שזו איות שגוי"
+        )
         return english
     except RuntimeError as e:
         return {"error": str(e), "query": query, "results": [], "count": 0}
@@ -289,19 +293,30 @@ def _t_wikipedia_page(title: str = "", **_: Any) -> Dict[str, Any]:
 
 
 def _t_read_url(url: str = "", **_: Any) -> Dict[str, Any]:
+    url = (url or "").strip()
+    if not url:
+        return {"error": "חסר url"}
     try:
         parsed = urlparse(url)
     except Exception:
         return {"error": "URL לא חוקי"}
     if parsed.scheme not in ("http", "https"):
         return {"error": "רק http/https מותרים"}
+
+    # urlopen דורש URL ב-ASCII בלבד. כתובות עם עברית/רוסית צריכות
+    # percent-encoding, אחרת מתקבל 'ascii codec can't encode characters'.
     try:
-        raw = _http(url, timeout=20)
+        encoded = quote(url, safe=":/?#[]@!$&'()*+,;=%")
+    except Exception as e:
+        return {"error": f"לא ניתן לקרוא את הכתובת: {e}"}
+
+    try:
+        raw = _http(encoded, timeout=20)
     except Exception as e:
         return {"error": f"ההורדה נכשלה: {e}"}
     title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.I | re.S)
     return {
-        "url": url,
+        "url": encoded,
         "title": html.unescape(title_match.group(1)).strip()[:200] if title_match else "",
         "text": _html_to_text(raw)[:MAX_TOOL_BYTES],
     }
