@@ -73,6 +73,9 @@ def active_provider() -> str:
 
 # ------------------------------------------------------------------ transport
 def _post_json(url: str, payload: dict, api_key: str, timeout: int) -> dict:
+    """שולח בקשה ל-API תואם OpenAI. ממיר שגיאות HTTP להודעה קריאה."""
+    from urllib.error import HTTPError, URLError
+
     body = json.dumps(payload).encode()
     req = URLRequest(
         url,
@@ -82,8 +85,25 @@ def _post_json(url: str, payload: dict, api_key: str, timeout: int) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="replace")[:600]
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(raw)
+            err = parsed.get("error", parsed)
+            msg = err.get("message") if isinstance(err, dict) else err
+            msg = msg or raw
+        except Exception:
+            msg = raw or str(e.reason)
+        raise RuntimeError(f"HTTP {e.code}: {msg}") from None
+    except URLError as e:
+        raise RuntimeError(f"network error: {e.reason}") from None
 
 
 def _chat_once(provider: Dict[str, str], messages: List[dict], tools: list, timeout: int) -> dict:
