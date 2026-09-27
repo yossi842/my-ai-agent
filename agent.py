@@ -53,6 +53,20 @@ SEARCH_RULES = (
 )
 DEFAULT_SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT + SEARCH_RULES
 
+# סדר עדיפות הכלים - נובע ממדידה, לא מניחות:
+# אתרים עם הגנת בוטים חוסמים IP של data center, והדפדפן הוא המשאב
+# היקר ביותר. לכן קודם שכבת HTTP, ורק אם היא לא מספיקה - דפדפן.
+TOOL_PRIORITY_RULES = (
+    "\nכללים לכלי אינטרנט - חשוב מאוד:\n"
+    "1. למצוא מידע או אתר: השתמש תמיד ב-web_search קודם. זה מהיר ולא נחסם.\n"
+    "2. לקרוא תוכן של כתובת: השתמש ב-fetch_page קודם - אין צורך בדפדפן.\n"
+    "3. רק אם הדף דינמי מדי והטקסט חסר, או שצריך אינטראקציה אמיתית "
+    "(התחבנות, לחיצה, מילוי טופס) - השתמש ב-browser_ וכליו.\n"
+    "4. לעולם אל תחפש דרך דפדפן. חיפוש דרך דפדפן נחסם על ידי CAPTCHA.\n"
+    "5. אם כלי דפדפן מחזיר error או hint - חזור מיד ל-fetch_page, אל תנסה שוב.\n"
+    "6. בסיום משימת גלישה קרא ל-browser_close כדי לשחרר זיכרון.\n"
+)
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, "")).strip() or default)
@@ -296,7 +310,8 @@ def run_agent(
     timeout = _int_env("AGENT_TIMEOUT", 90)
     use_tools = os.getenv("AGENT_TOOLS", "1").strip() not in ("0", "false", "no")
 
-    system_prompt = (os.getenv("AGENT_SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT)
+    system_prompt = ((os.getenv("AGENT_SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT)
+                     + TOOL_PRIORITY_RULES)
     memory_limit = _int_env("MEMORY_MAX_MESSAGES", 12)
 
     history: List[dict] = [{"role": "system", "content": system_prompt}]
