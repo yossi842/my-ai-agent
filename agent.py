@@ -80,8 +80,10 @@ def _int_env(name: str, default: int) -> int:
 #
 # מודלי גיבוי למקרה שהמודל המוגדר לא קיים / אינו זמין למפתח.
 # Groq מסיר מודלים מהקטלוג מדי פעם, ואז מתקבל 404 במקום תשובה.
+SEARCH_TOOLS = ("web_search", "wikipedia_search")
+MAX_SEARCH_CALLS = _int_env("MAX_SEARCH_CALLS", 3)
+
 MODEL_FALLBACKS = {
-    # רק מודלים שתומכים ב-tool calling — אחרת הסוכן לא יכול לעבוד כלל.
     "groq": [
         "openai/gpt-oss-120b",
         "qwen/qwen3.8-27b",
@@ -324,6 +326,7 @@ def run_agent(
 
     steps: List[dict] = []
     seen_tools: Dict[tuple, Any] = {}
+    search_count = 0
     used_tools = False
     answer = ""
     last_errors: List[str] = []
@@ -385,8 +388,26 @@ def run_agent(
                                     "different query, or answer without this tool.",
                             "previous_result": seen_tools[key],
                         }
+                    elif name in SEARCH_TOOLS and search_count >= MAX_SEARCH_CALLS:
+                        # תקציב קשיח. ההנחיה בפרומפט לבדה לא מספיקה:
+                        # מודלים קטנים מתעלמים ממנה ומבצעים 5-6 חיפושים
+                        # כמעט זהים, בזבוז של זמן וטוקנים.
+                        result = {
+                            "budget_exhausted": True,
+                            "note": f"Search budget for this task is {MAX_SEARCH_CALLS}. "
+                                    "Do NOT search again. Use web_search results you "
+                                    "already have, or call fetch_page on a URL you found, "
+                                    "or answer with what you know and say clearly what "
+                                    "you could not verify.",
+                        }
+                        steps.append({"step": step, "tool": name, "args": args, "result": result})
+                        emit({"type": "tool", "name": name, "args": args})
+                        convo.append(_tool_result_message(call, result))
+                        continue
                     else:
                         result = run_tool(name, args)
+                        if name in SEARCH_TOOLS:
+                            search_count += 1
                         seen_tools[key] = result
 
                     steps.append({"step": step, "tool": name, "args": args, "result": result})
