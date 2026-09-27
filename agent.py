@@ -71,6 +71,13 @@ MODEL_FALLBACKS = {
         "qwen/qwen3.8-27b",
         "openai/gpt-oss-20b",
     ],
+    "gemini": [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
+        "gemini-3.8-flash-lite",
+    ],
 }
 
 
@@ -98,15 +105,20 @@ def providers() -> List[Dict[str, str]]:
             "id": "gemini",
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
             "api_key": gem,
-            "model": (os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"),
+            "model": (os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"),
         })
     return out
 
 
-def provider_variants() -> List[Dict[str, str]]:
-    """כל הזוגות (ספק, מודל) לניסיון: המודל המוגדר ואחריו מודלי הגיבוי."""
+def provider_variants(only: Optional[str] = None) -> List[Dict[str, str]]:
+    """כל הזוגות (ספק, מודל) לניסיון: המודל המוגדר ואחריו מודלי הגיבוי.
+
+    אם מועבר only, מתחזרים רק את המודלים של אותו ספק - שימושי לבדיקה.
+    """
     out: List[Dict[str, str]] = []
     for p in providers():
+        if only and p["id"] != only:
+            continue
         out.append(p)
         for model in MODEL_FALLBACKS.get(p["id"], []):
             if model != p["model"]:
@@ -245,6 +257,7 @@ def run_agent(
     goal: str,
     session_id: str = "default",
     on_event: Optional[Callable[[dict], None]] = None,
+    provider_filter: Optional[str] = None,
 ) -> dict:
     """מריץ את הסוכן על משימה ומחזיר dict עם התשובה, הצעדים והזמן."""
     started = time.time()
@@ -266,12 +279,17 @@ def run_agent(
     if fast:
         return quick(fast)
 
-    provs = providers()
-    if not provs:
+    variants = provider_variants(provider_filter)
+    if not variants:
+        if provider_filter:
+            return quick(
+                f"הספק '{provider_filter}' אינו מוגדר בשרת. "
+                "הספקים הפעילים: " + (", ".join(p["id"] for p in providers()) or "אין")
+            )
         return quick(
             "אין מפתח API מוגדר בשרת, ולכן אני במצב חזרתי מקומי בלבד.\n"
             "בדוק את /api/info. אם זו התקלה הראשונה שלך — צריך להוסיף GROQ_API_KEY "
-            "ב-Render → Environment ואז לבצע redeploy."
+            "או GEMINI_API_KEY ב-Render → Environment ואז לבצע redeploy."
         )
 
     max_steps = _int_env("AGENT_MAX_STEPS", 8)
@@ -291,7 +309,7 @@ def run_agent(
     answer = ""
     last_errors: List[str] = []
 
-    for provider in provider_variants():
+    for provider in variants:
         convo = list(history)
         try:
             for step in range(1, max_steps + 1):
