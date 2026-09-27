@@ -118,6 +118,44 @@ def _mojeek(query: str) -> List[dict]:
     return results
 
 
+def _post_json(url: str, payload: dict, timeout: int = 25, headers: Optional[dict] = None) -> dict:
+    req = URLRequest(url, data=json.dumps(payload).encode(), method="POST",
+                     headers={"Content-Type": "application/json", "User-Agent": _UA, **(headers or {})})
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _tavily(query: str, limit: int) -> List[dict]:
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not key:
+        return []
+    data = _post_json("https://api.tavily.com/search", {
+        "api_key": key, "query": query, "max_results": limit,
+        "search_depth": "basic", "include_answer": True,
+    }, timeout=30)
+    out = [{"title": r.get("title", "")[:160], "url": r.get("url", ""),
+            "snippet": (r.get("content") or "")[:300]} for r in data.get("results", [])]
+    if data.get("answer") and out:
+        out.insert(0, {"title": "READY_ANSWER", "url": "", "snippet": str(data["answer"])[:400]})
+    return out
+
+
+def _serper(query: str, limit: int) -> List[dict]:
+    key = os.getenv("SERPER_API_KEY", "").strip()
+    if not key:
+        return []
+    data = _post_json("https://google.serper.dev/search", {"q": query, "num": limit},
+                      timeout=25, headers={"X-API-KEY": key})
+    out = [{"title": (r.get("title") or "")[:160], "url": r.get("link", ""),
+            "snippet": (r.get("snippet") or "")[:300]}
+           for r in data.get("organic", [])]
+    box = data.get("answerBox") or {}
+    snippet = box.get("answer") or box.get("snippet") or ""
+    if snippet:
+        out.insert(0, {"title": "READY_ANSWER", "url": box.get("link", ""), "snippet": str(snippet)[:400]})
+    return out
+
+
 def _t_web_search(query: str = "", limit: int = 8) -> Dict[str, Any]:
     """חפש באינטרנט. מוחזר רשימת תוצאות עם כותרת, כתובת ותקציר."""
     query = (query or "").strip()
@@ -128,6 +166,8 @@ def _t_web_search(query: str = "", limit: int = 8) -> Dict[str, Any]:
 
     # סדר העדפה: Mojeek (לא חוסם) -> DuckDuckGo -> Wikipedia
     engines = (
+        ("tavily", lambda q: _tavily(q, limit)),
+        ("serper", lambda q: _serper(q, limit)),
         ("mojeek", _mojeek),
         ("duckduckgo", _ddg),
         ("wikipedia", lambda q: _wikipedia_search(q, limit)),
