@@ -18,7 +18,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from typing import List, Optional
+from typing import List
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,7 +102,7 @@ class ChatRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------- pages
-@app.get("/healthz", methods=["GET", "HEAD"])
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz() -> dict:
     return {"status": "ok", "version": VERSION, "provider": providers()[0]["id"] if providers() else "local"}
 
