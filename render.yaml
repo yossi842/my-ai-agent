@@ -1,13 +1,51 @@
 services:
   - type: web
     name: my-ai-agent
-    runtime: python3
+    runtime: python
     region: frankfurt
     branch: main
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: free
     healthCheckPath: /healthz
+    autoDeployTrigger: onCommit
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.9"
+      # === מפתח המודל: הפעל את אחד מהשלושה ===
+      - key: GROQ_API_KEY
+        sync: false        # חינם, בלי כרטיס — console.groq.com/keys
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      # - key: GEMINI_API_KEY
+      #   sync: false
+      # - key: GEMINI_MODEL
+      #   value: gemini-2.0-flash
+      # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: OPENAI_MODEL
+      #   value: gpt-4o-mini
+
+      # === אבטחה ===
+      - key: AGENT_API_KEY
+        generateValue: true   # מחזיר 401 ללא X-API-Key נכון
+      - key: ALLOWED_ORIGINS
+        value: ""             # ריק = same-origin בלבד (מומלץ)
+      - key: RATE_LIMIT_PER_MIN
+        value: "20"
+
+      # === התנהגות הסוכן ===
+      - key: AGENT_TOOLS
+        value: "1"
+      - key: AGENT_MAX_STEPS
+        value: "8"
+      - key: AGENT_TIMEOUT
+        value: "90"
+      - key: AGENT_TEMPERATURE
+        value: "0.3"
+      - key: AGENT_MAX_CONCURRENCY
+        value: "4"
+      - key: MEMORY_MAX_MESSAGES
+        value: "12"
+      - key: AGENT_SYSTEM_PROMPT
+        sync: false
