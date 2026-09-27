@@ -1,6 +1,11 @@
 """
 my-ai-agent — סוכן AI בעברית מוכן ל-Render
 Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+Providers (by env vars, no keys in code):
+  1. GROQ_API_KEY (+ GROQ_MODEL, default llama-3.3-70b-versatile) — OpenAI-compatible, fast free tier
+  2. GEMINI_API_KEY / GOOGLE_API_KEY (+ GEMINI_MODEL, default gemini-2.0-flash)
+  3. OPENAI_API_KEY (+ OPENAI_MODEL, default gpt-4o-mini)
+Fallback: local rule-based agent (works without any key).
 """
 import os
 import re
@@ -9,11 +14,11 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="my-ai-agent", version="1.0.0")
+app = FastAPI(title="my-ai-agent", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +28,7 @@ app.add_middleware(
 )
 
 ISRAEL_TZ = timezone(timedelta(hours=3))  # Asia/Jerusalem
+SYSTEM_PROMPT = "אתה סוכן AI ידידותי שעונה בעברית, קצר, ברור ועוזר. ענה תמיד בעברית אלא אם המשתמש ביקש אחרת."
 
 
 class ChatMessage(BaseModel):
@@ -38,19 +44,23 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     timestamp: str
+    provider: str = "local"
 
 
-HELP_TEXT = """היי, אני הסוכן שלך! הנה מה שאני יודע לעשות כבר עכשיו (בלי מפתח API):
+HELP_TEXT = """היי, אני הסוכן שלך עם מודל AI אמיתי!
 
-- לענות בעברית על שאלות כלליות
-- חישובים מתמטיים — כתוב למשל: חשב 12*8+5
-- שעה / תאריך — כתוב: מה השעה? או מה התאריך?
-- עזרה — כתוב: עזרה
+אני יודע:
+- לענות בעברית על כל שאלה
+- לכתוב, לסכם, לתרגם, לעזור בקוד
+- חישובים — כתוב למשל: חשב 12*8+5
+- שעה / תאריך — כתוב: מה השעה?
 
-טיפ: אם תוסיף משתנה סביבה OPENAI_API_KEY ב-Render, אשתמש בו אוטומטית לתשובות חכמות יותר."""
+פשוט כתוב לי מה שתרצה."""
+
 
 def now_israel():
     return datetime.now(ISRAEL_TZ)
+
 
 def try_math(text: str) -> Optional[str]:
     lowered = text.strip().lower()
@@ -83,7 +93,7 @@ def try_math(text: str) -> Optional[str]:
         return "לא הצלחתי לחשב את זה. נסה למשל: חשב 12*8+5"
 
 
-def agent_reply(user_text: str, history: List[ChatMessage]) -> str:
+def agent_reply_local(user_text: str) -> str:
     text = (user_text or "").strip()
     if not text:
         return "כתוב לי משהו ואשמח לעזור"
@@ -91,70 +101,144 @@ def agent_reply(user_text: str, history: List[ChatMessage]) -> str:
     if low in ["/help", "עזרה", "help", "מה אתה יודע", "מה אתה יודע לעשות"]:
         return HELP_TEXT
     if any(k in low for k in ["מה השעה", "שעה עכשיו", "what time"]):
-        t = now_israel().strftime("%H:%M")
-        return f"השעה עכשיו (ישראל): {t}"
+        return f"השעה עכשיו (ישראל): {now_israel().strftime('%H:%M')}"
     if any(k in low for k in ["מה התאריך", "תאריך היום", "what date", "איזה תאריך"]):
-        d = now_israel().strftime("%d/%m/%Y")
-        return f"התאריך היום (ישראל): {d}"
+        return f"התאריך היום (ישראל): {now_israel().strftime('%d/%m/%Y')}"
     math_result = try_math(text)
     if math_result:
         return math_result
     if low in ["היי", "היי!", "שלום", "הלו", "hi", "hello", "hey"]:
-        return "היי! מה תרצה לעשות היום? אפשר לשאול שאלה, לבקש חישוב (חשב 7*9), או לכתוב עזרה."
+        return "היי! מה תרצה לעשות היום?"
     if "תודה" in low or "thanks" in low:
         return "בכיף! אם יש עוד משהו — אני כאן."
-    if "מי אתה" in low or "מה אתה" in low or "who are you" in low:
-        return "אני my-ai-agent — סוכן פייתון (FastAPI) שרץ על Render. נבניתי כדי לענות, לחשב ולעזור בעברית, ישירות מהדפדפן."
-    if "render" in low or "רנדר" in low or "דפלוי" in low or "deploy" in low:
-        return "כדי להעלות אותי ל-Render: חבר את הריפו מ-GitHub, בחר Python 3, Branch main, Region Frankfurt, Build: pip install -r requirements.txt, Start: uvicorn main:app --host 0.0.0.0 --port $PORT, בחר Free, ולחץ Create Web Service."
+    if "מי אתה" in low or "what model" in low or "איזה מודל" in low:
+        return "אני my-ai-agent — רץ על Render עם מודל Groq מהיר (Llama) וגיבוי מקומי לעזרה בעברית."
     return (
         f"קיבלתי: {text}\n\n"
-        "אני בגרסת בסיס (ללא מודל חיצוני), אז אענה כמיטב יכולתי:\n"
-        "- לחישוב כתוב חשב ... למשל חשב 200*0.15\n"
-        "- לשעה/תאריך כתוב מה השעה?\n"
-        "- לרשימת יכולות כתוב עזרה\n\n"
-        "רוצה שאחבר מודל שפה חכם? הוסף OPENAI_API_KEY במשתני הסביבה ב-Render ועשה Redeploy."
+        "אני בגרסת בסיס מקומית כרגע. בדוק חיבור מודל ב-/api/info."
     )
+
+
+def build_openai_messages(message: str, history: List[ChatMessage]):
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for h in (history or [])[-10:]:
+        if h.role in ("user", "assistant") and h.content:
+            msgs.append({"role": h.role, "content": h.content})
+    msgs.append({"role": "user", "content": message})
+    return msgs
+
+
+def call_openai_compatible(api_key: str, base_url: str, model: str, message: str, history: List[ChatMessage]) -> str:
+    from urllib.request import Request as URLRequest, urlopen
+    import json as _json
+    msgs = build_openai_messages(message, history)
+    data = _json.dumps({"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1024}).encode()
+    r = URLRequest(base_url.rstrip("/") + "/chat/completions",
+                   data=data,
+                   headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    with urlopen(r, timeout=40) as resp:
+        out = _json.loads(resp.read().decode())
+    return out["choices"][0]["message"]["content"]
+
+
+def call_gemini(api_key: str, model: str, message: str, history: List[ChatMessage]) -> str:
+    from urllib.request import Request as URLRequest, urlopen
+    from urllib.parse import quote
+    import json as _json
+    contents = []
+    for h in (history or [])[-10:]:
+        if not h.content:
+            continue
+        role = "model" if h.role == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": h.content}]})
+    contents.append({"role": "user", "parts": [{"text": message}]})
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}/:generateContent?key={api_key}"
+    # NOTE: key is sent as query param per Google API spec (env var only, never logged)
+    data = _json.dumps(body).encode()
+    r = URLRequest(url, data=data, headers={"Content-Type": "application/json"})
+    with urlopen(r, timeout=40) as resp:
+        out = _json.loads(resp.read().decode())
+    return out["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def active_provider() -> str:
+    if os.getenv("GROQ_API_KEY", "").strip():
+        return "groq:" + os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    gem = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if gem:
+        return "gemini:" + os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return "openai:" + os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    return "local"
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "time": now_israel().isoformat()}
+    return {"status": "ok", "time": now_israel().isoformat(), "provider": active_provider()}
 
 
 @app.get("/api/info")
 def info():
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
-    return {"name": "my-ai-agent", "version": "1.0.0", "language": "python", "openai_connected": has_key}
+    groq = bool(os.getenv("GROQ_API_KEY", "").strip())
+    gem = bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
+    oai = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    return {
+        "name": "my-ai-agent",
+        "version": "2.0.0",
+        "language": "python",
+        "provider": active_provider(),
+        "groq_connected": groq,
+        "gemini_connected": gem,
+        "openai_connected": oai,
+        "groq_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if api_key:
+    history = req.history or []
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
         try:
-            from urllib.request import Request as URLRequest, urlopen
-            import json as _json
-            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-            msgs = [{"role": "system", "content": "אתה סוכן AI ידידותי שעונה בעברית, קצר וברור."}]
-            for h in (req.history or [])[-10:]:
-                if h.role in ("user", "assistant") and h.content:
-                    msgs.append({"role": h.role, "content": h.content})
-            msgs.append({"role": "user", "content": req.message})
-            data = _json.dumps({"model": model, "messages": msgs, "temperature": 0.7}).encode()
-            r = URLRequest("https://api.openai.com/v1/chat/completions",
-                           data=data,
-                           headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-            with urlopen(r, timeout=30) as resp:
-                out = _json.loads(resp.read().decode())
-            reply = out["choices"][0]["message"]["content"]
-            return ChatResponse(reply=reply, timestamp=now_israel().isoformat())
+            model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+            reply = call_openai_compatible(groq_key, "https://api.groq.com/openai/v1", model, req.message, history)
+            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"groq:{model}")
         except Exception as e:
-            fallback = agent_reply(req.message, req.history or [])
-            return ChatResponse(reply=fallback + f"\n\n(חיבור OpenAI נכשל, עניתי מקומית)",
-                                timestamp=now_israel().isoformat())
-    reply = agent_reply(req.message, req.history or [])
-    return ChatResponse(reply=reply, timestamp=now_israel().isoformat())
+            err = str(e)[:200]
+            # fall through to next provider, keep err for debugging via logs only
+            print(f"Groq failed: {err}")
+    gem_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if gem_key:
+        try:
+            model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+            reply = call_gemini(gem_key, model, req.message, history)
+            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"gemini:{model}")
+        except Exception as e:
+            print(f"Gemini failed: {str(e)[:200]}")
+    oai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if oai_key:
+        try:
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+            reply = call_openai_compatible(oai_key, "https://api.openai.com/v1", model, req.message, history)
+            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"openai:{model}")
+        except Exception as e:
+            print(f"OpenAI failed: {str(e)[:200]}")
+    # Local instant answers for time/date/math/help even when keys exist
+    local = agent_reply_local(req.message)
+    if local and not local.startswith("קיבלתי:"):
+        return ChatResponse(reply=local, timestamp=now_israel().isoformat(), provider="local")
+    if not groq_key and not gem_key and not oai_key:
+        return ChatResponse(reply=local, timestamp=now_israel().isoformat(), provider="local")
+    # Keys exist but all providers failed
+    fallback = agent_reply_local(req.message)
+    return ChatResponse(reply=fallback + "\n\n(כל המודלים נכשלו זמנית — עניתי מקומית. בדוק לוגים / מכסה חינמית.)",
+                        timestamp=now_israel().isoformat(), provider="local")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -193,7 +277,7 @@ footer{text-align:center;font-size:12px;opacity:.6;padding:10px}
 <body>
 <div class="wrap">
 <header>
-<div><h1><span class="dot"></span>my-ai-agent</h1><p>הסוכן האישי שלך - מחובר ופעיל</p></div>
+<div><h1><span class="dot"></span>my-ai-agent</h1><p id="prov">הסוכן האישי שלך - מחובר ופעיל</p></div>
 <button class="clear" onclick="clearChat()">נקה צאט</button>
 </header>
 <div id="chat"></div>
@@ -201,20 +285,21 @@ footer{text-align:center;font-size:12px;opacity:.6;padding:10px}
 <button onclick="ask('עזרה')">עזרה</button>
 <button onclick="ask('מה השעה?')">מה השעה?</button>
 <button onclick="ask('חשב 12*8+5')">חשב 12*8+5</button>
-<button onclick="ask('מי אתה?')">מי אתה?</button>
+<button onclick="ask('כתוב לי בדיחה בעברית')">בדיחה</button>
 </div>
 <form onsubmit="send(event)">
 <input id="inp" placeholder="כתוב הודעה לסוכן..." autocomplete="off">
 <button class="send" type="submit">שלח</button>
 </form>
-<footer>Python FastAPI על Render - Frankfurt - Free Plan</footer>
+<footer>Groq + Gemini על Render - Frankfurt - Free Plan</footer>
 </div>
 <script>
 let history=[];
 const chat=document.getElementById('chat');
 const inp=document.getElementById('inp');
+fetch('/api/info').then(r=>r.json()).then(j=>{document.getElementById('prov').textContent='מחובר: '+j.provider;}).catch(()=>{});
 function addMsg(t,c){const d=document.createElement('div');d.className='msg '+c;d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;}
-addMsg('היי! אני הסוכן שלך. כתוב לי משהו או לחץ על אחת הדוגמאות למטה.','bot');
+addMsg('היי! אני הסוכן החכם שלך עם AI אמיתי. שאל אותי כל דבר בעברית.','bot');
 function ask(t){inp.value=t;send(new Event('submit'));}
 async function send(e){e.preventDefault();const text=inp.value.trim();if(!text)return;inp.value='';addMsg(text,'user');history.push({role:'user',content:text});const tp=addMsg('מקליד...','bot typing');try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:history})});const j=await r.json();tp.remove();addMsg(j.reply,'bot');history.push({role:'assistant',content:j.reply});}catch(err){tp.remove();addMsg('שגיאת חיבור לשרת. נסה שוב.','bot');}}
 function clearChat(){chat.innerHTML='';history=[];addMsg('הצאט נוקה. איך אפשר לעזור?','bot');}
