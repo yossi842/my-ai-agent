@@ -45,11 +45,11 @@ def _int_env(name: str, default: int) -> int:
 # מודלי גיבוי למקרה שהמודל המוגדר לא קיים / אינו זמין למפתח.
 # Groq מסיר מודלים מהקטלוג מדי פעם, ואז מתקבל 404 במקום תשובה.
 MODEL_FALLBACKS = {
+    # רק מודלים שתומכים ב-tool calling — אחרת הסוכן לא יכול לעבוד כלל.
     "groq": [
         "openai/gpt-oss-120b",
         "qwen/qwen3.8-27b",
         "openai/gpt-oss-20b",
-        "allam-2-7b",
     ],
 }
 
@@ -160,11 +160,11 @@ def _chat_once(provider: Dict[str, str], messages: List[dict], tools: list, time
     )
 
 
-def _tool_results_to_message(tool_calls: list, results: List[dict]) -> dict:
+def _tool_result_message(tool_call: dict, result: dict) -> dict:
+    """בונה הודעת role=tool שמוחזרת למודל אחרי הרצת כלי."""
     return {
         "role": "tool",
-        "tool_call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-        "name": (tc.get("function") or {}).get("name", ""),
+        "tool_call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
         "content": json.dumps(result, ensure_ascii=False),
     }
 
@@ -279,7 +279,6 @@ def run_agent(
                     break
 
                 used_tools = True
-                results: List[dict] = []
                 for call in tool_calls:
                     name = (call.get("function") or {}).get("name", "")
                     raw_args = (call.get("function") or {}).get("arguments") or "{}"
@@ -290,12 +289,11 @@ def run_agent(
                     result = run_tool(name, args)
                     steps.append({"step": step, "tool": name, "args": args, "result": result})
                     emit({"type": "tool", "name": name, "args": args})
-                    results.append(result)
-                    convo.append(_tool_results_to_message(call, [result]))
+                    convo.append(_tool_result_message(call, result))
             if answer:
                 break
         except Exception as e:
-            last_errors.append(f"{provider['id']}: {e}")
+            last_errors.append(f"{provider['id']}/{provider['model']}: {e}")
 
     if not answer:
         detail = (" | ".join(last_errors))[:300] if last_errors else "ללא פרטים"
