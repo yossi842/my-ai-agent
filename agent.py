@@ -36,6 +36,14 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+SEARCH_RULES = (
+    "כלל מספר 4א: בחיפוש השתמש בשם הנפוץ ביותר - קצר ובלי שם מלא. "
+    "אם אין תוצאות, נסה עוד ניסוח אחד ואז עצור. אל תחזור על אותו חיפוש.\n"
+    "כלל מספר 5: אל תמציג עובדות. אם אינך יודע, אמר שאינך יודע ואל תמשיך לחפש.\n"
+)
+DEFAULT_SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT + SEARCH_RULES
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, "")).strip() or default)
@@ -269,6 +277,7 @@ def run_agent(
     history.append({"role": "user", "content": goal})
 
     steps: List[dict] = []
+    seen_tools: Dict[tuple, Any] = {}
     used_tools = False
     answer = ""
     last_errors: List[str] = []
@@ -318,7 +327,22 @@ def run_agent(
                         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                     except Exception:
                         args = {"_raw": str(raw_args)[:200]}
-                    result = run_tool(name, args)
+
+                    # מניעת כפילויות: אם כבר הרצנו את אותו כלי עם אותם ארגומנים
+                    # בריצה הזו, לא מריצים שוב - חוסך טוקנים וזמן.
+                    key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                    if key in seen_tools:
+                        result = {
+                            "cached": True,
+                            "note": "This exact call already ran in this task. "
+                                    "Use the result you already received, or try a "
+                                    "different query, or answer without this tool.",
+                            "previous_result": seen_tools[key],
+                        }
+                    else:
+                        result = run_tool(name, args)
+                        seen_tools[key] = result
+
                     steps.append({"step": step, "tool": name, "args": args, "result": result})
                     emit({"type": "tool", "name": name, "args": args})
                     convo.append(_tool_result_message(call, result))
