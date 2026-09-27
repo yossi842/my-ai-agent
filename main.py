@@ -1,308 +1,305 @@
 """
-my-ai-agent — סוכן AI בעברית מוכן ל-Render
-Start: uvicorn main:app --host 0.0.0.0 --port $PORT
-Providers (by env vars, no keys in code):
-  1. GROQ_API_KEY (+ GROQ_MODEL, default llama-3.3-70b-versatile) — OpenAI-compatible, fast free tier
-  2. GEMINI_API_KEY / GOOGLE_API_KEY (+ GEMINI_MODEL, default gemini-2.0-flash)
-  3. OPENAI_API_KEY (+ OPENAI_MODEL, default gpt-4o-mini)
-Fallback: local rule-based agent (works without any key).
+my-ai-agent v3 — סוכן AI אוטונומי בעברית, Python + FastAPI על Render.
+
+נקודת כניסה: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+נתיבים:
+  GET  /                 ממשק צ'אט
+  GET  /healthz          בדיקת חיים (גם ל-HEAD) — ברירת מחדל של Render
+  GET  /api/info         מידע: ספק פעיל, כלים, מצב
+  POST /api/chat         הרצת סוכן. דורש X-API-Key כשמוגדר AGENT_API_KEY
+  GET  /api/notes        צפייה בזיכרון הקבוע
+  GET  /api/history      היסטוריית שיחה לפי sessionId
 """
+from __future__ import annotations
+
+import hmac
 import os
 import re
-import math
-from datetime import datetime, timezone, timedelta
+import time
+from collections import defaultdict, deque
 from typing import List, Optional
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="my-ai-agent", version="2.0.0")
+from agent import providers, run_agent_limited
+from tools import TOOL_SCHEMAS, _load_notes
 
+VERSION = "3.0.0"
+
+app = FastAPI(title="my-ai-agent", version=VERSION, docs_url="/api/docs", redoc_url=None)
+
+# ------------------------------------------------------------------- settings
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+API_KEY = os.getenv("AGENT_API_KEY", "").strip()
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20") or 20)
+MAX_CONCURRENT = int(os.getenv("AGENT_MAX_CONCURRENCY", "4") or 4)
+
+# CORS: כברירת מחדל סגור לגמרי (same-origin בלבד). לפתיחה לדומיין חיצוני -
+# הגדר ALLOWED_ORIGINS=https://example.com
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
-ISRAEL_TZ = timezone(timedelta(hours=3))  # Asia/Jerusalem
-SYSTEM_PROMPT = "אתה סוכן AI ידידותי שעונה בעברית, קצר, ברור ועוזר. ענה תמיד בעברית אלא אם המשתמש ביקש אחרת."
+# ------------------------------------------------------------------ rate limit
+_hits: dict = defaultdict(deque)
 
 
-class ChatMessage(BaseModel):
+def rate_limit(request: Request) -> None:
+    if RATE_LIMIT_PER_MIN <= 0:
+        return
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    q = _hits[ip]
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RATE_LIMIT_PER_MIN:
+        raise HTTPException(status_code=429, detail="יותר מדי בקשות. נסה שוב בעוד דקה.")
+    q.append(now)
+    if len(_hits) > 2000:  # ניקוי זיכרון
+        for key in [k for k, v in _hits.items() if not v]:
+            _hits.pop(key, None)
+
+
+def require_key(x_api_key: str = Header(default="")) -> None:
+    """מאמת את מפתח ה-API. אם לא הוגדר AGENT_API_KEY — מותר (מצב פתוח)."""
+    if not API_KEY:
+        return
+    if not x_api_key or not hmac.compare_digest(x_api_key.strip(), API_KEY):
+        raise HTTPException(status_code=401, detail="מפתח API לא חוקי (חסר כותרת X-API-Key).")
+
+
+# --------------------------------------------------------------------- models
+class ChatTurn(BaseModel):
     role: str = "user"
-    content: str = ""
+    content: str = Field(default="", max_length=8000)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: Optional[List[ChatMessage]] = []
+    message: str = Field(..., min_length=1, max_length=8000)
+    sessionId: str = Field(default="default", max_length=64)
+    history: List[ChatTurn] = Field(default_factory=list, max_length=20)
+
+    def clean_session(self) -> str:
+        """מנקה את מזהה השיחה — מונע הרמת קבצים משונים בשרת."""
+        return re.sub(r"[^A-Za-z0-9_:\-]", "", self.sessionId)[:64] or "default"
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    timestamp: str
-    provider: str = "local"
-
-
-HELP_TEXT = """היי, אני הסוכן שלך עם מודל AI אמיתי!
-
-אני יודע:
-- לענות בעברית על כל שאלה
-- לכתוב, לסכם, לתרגם, לעזור בקוד
-- חישובים — כתוב למשל: חשב 12*8+5
-- שעה / תאריך — כתוב: מה השעה?
-
-פשוט כתוב לי מה שתרצה."""
-
-
-def now_israel():
-    return datetime.now(ISRAEL_TZ)
-
-
-def try_math(text: str) -> Optional[str]:
-    lowered = text.strip().lower()
-    m = re.search(r"(?:חשב|calculate|calc|compute)\s*[:\-]?\s*(.+)", lowered)
-    expr_raw = None
-    if m:
-        expr_raw = m.group(1)
-    elif re.fullmatch(r"[\d\s\+\-\*\/\%\.\(\)\^\!x×÷]+", lowered) and re.search(r"\d", lowered):
-        expr_raw = lowered
-    if not expr_raw:
-        return None
-    expr = expr_raw.replace("x", "*").replace("×", "*").replace("÷", "/").replace("^", "**").strip()
-    expr = re.sub(r"[^0-9\+\-\*\/\%\.\(\)\s\!]", "", expr).strip()
-    if not expr or not re.search(r"\d", expr):
-        return None
-    if re.search(r"(__|import|os|sys|open|eval|exec)", expr):
-        return None
-    try:
-        if expr.endswith("!"):
-            n = int(expr[:-1].strip())
-            if 0 <= n <= 20:
-                return f"התוצאה של {expr_raw.strip()} היא: {math.factorial(n)}"
-            return None
-        allowed = {"__builtins__": {}}
-        result = eval(expr, allowed, {"math": math, "pi": math.pi, "e": math.e})
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        return f"התוצאה של {expr_raw.strip()} היא: {result}"
-    except Exception:
-        return "לא הצלחתי לחשב את זה. נסה למשל: חשב 12*8+5"
-
-
-def agent_reply_local(user_text: str) -> str:
-    text = (user_text or "").strip()
-    if not text:
-        return "כתוב לי משהו ואשמח לעזור"
-    low = text.lower()
-    if low in ["/help", "עזרה", "help", "מה אתה יודע", "מה אתה יודע לעשות"]:
-        return HELP_TEXT
-    if any(k in low for k in ["מה השעה", "שעה עכשיו", "what time"]):
-        return f"השעה עכשיו (ישראל): {now_israel().strftime('%H:%M')}"
-    if any(k in low for k in ["מה התאריך", "תאריך היום", "what date", "איזה תאריך"]):
-        return f"התאריך היום (ישראל): {now_israel().strftime('%d/%m/%Y')}"
-    math_result = try_math(text)
-    if math_result:
-        return math_result
-    if low in ["היי", "היי!", "שלום", "הלו", "hi", "hello", "hey"]:
-        return "היי! מה תרצה לעשות היום?"
-    if "תודה" in low or "thanks" in low:
-        return "בכיף! אם יש עוד משהו — אני כאן."
-    if "מי אתה" in low or "what model" in low or "איזה מודל" in low:
-        return "אני my-ai-agent — רץ על Render עם מודל Groq מהיר (Llama) וגיבוי מקומי לעזרה בעברית."
-    return (
-        f"קיבלתי: {text}\n\n"
-        "אני בגרסת בסיס מקומית כרגע. בדוק חיבור מודל ב-/api/info."
-    )
-
-
-def build_openai_messages(message: str, history: List[ChatMessage]):
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for h in (history or [])[-10:]:
-        if h.role in ("user", "assistant") and h.content:
-            msgs.append({"role": h.role, "content": h.content})
-    msgs.append({"role": "user", "content": message})
-    return msgs
-
-
-def call_openai_compatible(api_key: str, base_url: str, model: str, message: str, history: List[ChatMessage]) -> str:
-    from urllib.request import Request as URLRequest, urlopen
-    import json as _json
-    msgs = build_openai_messages(message, history)
-    data = _json.dumps({"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 1024}).encode()
-    r = URLRequest(base_url.rstrip("/") + "/chat/completions",
-                   data=data,
-                   headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    with urlopen(r, timeout=40) as resp:
-        out = _json.loads(resp.read().decode())
-    return out["choices"][0]["message"]["content"]
-
-
-def call_gemini(api_key: str, model: str, message: str, history: List[ChatMessage]) -> str:
-    from urllib.request import Request as URLRequest, urlopen
-    from urllib.parse import quote
-    import json as _json
-    contents = []
-    for h in (history or [])[-10:]:
-        if not h.content:
-            continue
-        role = "model" if h.role == "assistant" else "user"
-        contents.append({"role": role, "parts": [{"text": h.content}]})
-    contents.append({"role": "user", "parts": [{"text": message}]})
-    body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": contents,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}/:generateContent?key={api_key}"
-    # NOTE: key is sent as query param per Google API spec (env var only, never logged)
-    data = _json.dumps(body).encode()
-    r = URLRequest(url, data=data, headers={"Content-Type": "application/json"})
-    with urlopen(r, timeout=40) as resp:
-        out = _json.loads(resp.read().decode())
-    return out["candidates"][0]["content"]["parts"][0]["text"]
-
-
-def active_provider() -> str:
-    if os.getenv("GROQ_API_KEY", "").strip():
-        return "groq:" + os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    gem = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-    if gem:
-        return "gemini:" + os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-    if os.getenv("OPENAI_API_KEY", "").strip():
-        return "openai:" + os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    return "local"
-
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "time": now_israel().isoformat(), "provider": active_provider()}
-
-
-@app.get("/api/info")
-def info():
-    groq = bool(os.getenv("GROQ_API_KEY", "").strip())
-    gem = bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
-    oai = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    return {
-        "name": "my-ai-agent",
-        "version": "2.0.0",
-        "language": "python",
-        "provider": active_provider(),
-        "groq_connected": groq,
-        "gemini_connected": gem,
-        "openai_connected": oai,
-        "groq_model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-    }
-
-
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    history = req.history or []
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if groq_key:
-        try:
-            model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
-            reply = call_openai_compatible(groq_key, "https://api.groq.com/openai/v1", model, req.message, history)
-            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"groq:{model}")
-        except Exception as e:
-            err = str(e)[:200]
-            # fall through to next provider, keep err for debugging via logs only
-            print(f"Groq failed: {err}")
-    gem_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-    if gem_key:
-        try:
-            model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-            reply = call_gemini(gem_key, model, req.message, history)
-            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"gemini:{model}")
-        except Exception as e:
-            print(f"Gemini failed: {str(e)[:200]}")
-    oai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if oai_key:
-        try:
-            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-            reply = call_openai_compatible(oai_key, "https://api.openai.com/v1", model, req.message, history)
-            return ChatResponse(reply=reply, timestamp=now_israel().isoformat(), provider=f"openai:{model}")
-        except Exception as e:
-            print(f"OpenAI failed: {str(e)[:200]}")
-    # Local instant answers for time/date/math/help even when keys exist
-    local = agent_reply_local(req.message)
-    if local and not local.startswith("קיבלתי:"):
-        return ChatResponse(reply=local, timestamp=now_israel().isoformat(), provider="local")
-    if not groq_key and not gem_key and not oai_key:
-        return ChatResponse(reply=local, timestamp=now_israel().isoformat(), provider="local")
-    # Keys exist but all providers failed
-    fallback = agent_reply_local(req.message)
-    return ChatResponse(reply=fallback + "\n\n(כל המודלים נכשלו זמנית — עניתי מקומית. בדוק לוגים / מכסה חינמית.)",
-                        timestamp=now_israel().isoformat(), provider="local")
+# ---------------------------------------------------------------------- pages
+@app.get("/healthz", methods=["GET", "HEAD"])
+def healthz() -> dict:
+    return {"status": "ok", "version": VERSION, "provider": providers()[0]["id"] if providers() else "local"}
 
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return HTML_PAGE
+def home() -> HTMLResponse:
+    return HTMLResponse(HTML_PAGE)
 
 
-HTML_PAGE = """<!DOCTYPE html>
+@app.get("/api/info")
+def info() -> dict:
+    provs = providers()
+    return {
+        "name": "my-ai-agent",
+        "version": VERSION,
+        "status": "ok",
+        "agent_mode": True,
+        "provider": f"{provs[0]['id']}:{provs[0]['model']}" if provs else "local",
+        "providers_available": [p["id"] for p in provs],
+        "auth_required": bool(API_KEY),
+        "cors_origins": ALLOWED_ORIGINS or "same-origin only",
+        "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        "max_concurrent_runs": MAX_CONCURRENT,
+        "tools": [t["function"]["name"] for t in TOOL_SCHEMAS],
+        "notes_stored": len(_load_notes()),
+        "uptime_sec": int(time.time() - os.stat("/proc/self").st_ctime) if os.path.exists("/proc/self") else None,
+    }
+
+
+@app.post("/api/chat", dependencies=[Depends(rate_limit), Depends(require_key)])
+def chat(req: ChatRequest) -> JSONResponse:
+    session = req.clean_session()
+    result = run_agent_limited(goal=req.message, session_id=session)
+    status = 200 if result.get("ok") else 503
+    return JSONResponse(status_code=status, content=result)
+
+
+@app.get("/api/notes", dependencies=[Depends(require_key)])
+def notes() -> dict:
+    return {"notes": _load_notes()}
+
+
+@app.get("/api/history", dependencies=[Depends(require_key)])
+def history(sessionId: str = "default", limit: int = 20) -> dict:
+    from agent import _load_history
+    safe = re.sub(r"[^A-Za-z0-9_:\-]", "", sessionId)[:64] or "default"
+    return {"sessionId": safe, "messages": _load_history(safe, max(1, min(limit, 100)))}
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots() -> Response:
+    return Response("User-agent: *\nDisallow: /api/\nDisallow: /healthz\n", media_type="text/plain")
+
+
+@app.exception_handler(500)
+def on_500(_request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=500, content={"error": "שגיאה פנימית", "detail": str(exc)[:300]})
+
+
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>my-ai-agent - הסוכן שלי</title>
+<title>my-ai-agent — הסוכן שלי</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:linear-gradient(135deg,#0f172a,#1e1b4b 60%,#0f172a);color:#fff;min-height:100vh;display:flex;justify-content:center;padding:20px}
-.wrap{width:100%;max-width:760px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);border-radius:20px;overflow:hidden;display:flex;flex-direction:column;min-height:85vh}
-header{padding:18px 22px;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,.12)}
-header h1{margin:0;font-size:20px}
-header p{margin:2px 0 0;font-size:13px;opacity:.75}
-.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#22c55e;margin-left:8px}
-#chat{flex:1;padding:20px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;max-height:60vh}
-.msg{max-width:85%;padding:12px 15px;border-radius:14px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;font-size:15px}
-.user{align-self:flex-start;background:#2563eb}
-.bot{align-self:flex-end;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.15)}
+:root{--bg:#0b1120;--card:rgba(255,255,255,.06);--line:rgba(255,255,255,.14);--accent:#22c55e;--blue:#3b82f6}
+body{margin:0;font-family:'Segoe UI',Arial,sans-serif;
+  background:radial-gradient(1200px 600px at 80% -10%,#1e1b4b,transparent),linear-gradient(160deg,#0b1120,#111827);
+  color:#e5e7eb;min-height:100vh;display:flex;justify-content:center;padding:18px}
+.wrap{width:100%;max-width:820px;display:flex;flex-direction:column;min-height:92vh;
+  background:var(--card);border:1px solid var(--line);border-radius:20px;overflow:hidden;backdrop-filter:blur(8px)}
+header{padding:16px 20px;background:rgba(0,0,0,.28);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:19px;display:flex;align-items:center;gap:9px}
+.dot{width:10px;height:10px;border-radius:50%;background:#94a3b8;box-shadow:0 0 0 3px rgba(148,163,184,.18)}
+.dot.live{background:var(--accent);box-shadow:0 0 0 3px rgba(34,197,94,.2)}
+.badge{font-size:12px;padding:5px 10px;border-radius:999px;background:rgba(255,255,255,.09);
+  border:1px solid var(--line);white-space:nowrap}
+#log{flex:1;padding:18px 20px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;max-height:64vh}
+.msg{max-width:88%;padding:11px 14px;border-radius:14px;line-height:1.65;white-space:pre-wrap;
+  word-wrap:break-word;font-size:15px}
+.user{align-self:flex-start;background:var(--blue);color:#fff}
+.bot{align-self:flex-end;background:rgba(255,255,255,.1);border:1px solid var(--line)}
+.bot .prov{font-size:11px;opacity:.55;margin-top:6px;display:block}
+.err{align-self:flex-end;background:rgba(239,68,68,.16);border:1px solid rgba(239,68,68,.4)}
+.steps{font-size:12px;opacity:.7;margin-top:6px;border-top:1px dashed var(--line);padding-top:6px}
 .examples{display:flex;flex-wrap:wrap;gap:8px;padding:0 20px 10px}
-.examples button{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:20px;padding:7px 13px;cursor:pointer;font-size:13px}
-form{display:flex;gap:10px;padding:16px 20px;background:rgba(0,0,0,.25);border-top:1px solid rgba(255,255,255,.12)}
-input{flex:1;padding:13px 15px;border-radius:12px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.1);color:#fff;font-size:15px;outline:none}
-button.send{background:#22c55e;border:none;color:#052e16;font-weight:bold;border-radius:12px;padding:0 22px;cursor:pointer;font-size:15px}
-button.clear{background:transparent;border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:10px;padding:6px 12px;cursor:pointer;font-size:12px}
-.typing{opacity:.7;font-style:italic}
-footer{text-align:center;font-size:12px;opacity:.6;padding:10px}
+.examples button{background:rgba(255,255,255,.08);border:1px solid var(--line);color:#e5e7eb;
+  border-radius:18px;padding:7px 12px;cursor:pointer;font-size:13px}
+.examples button:hover{background:rgba(255,255,255,.16)}
+form{display:flex;gap:10px;padding:14px 20px;background:rgba(0,0,0,.28);border-top:1px solid var(--line)}
+input{flex:1;padding:12px 14px;border-radius:12px;border:1px solid var(--line);
+  background:rgba(255,255,255,.07);color:#fff;font-size:15px;outline:none}
+input:focus{border-color:var(--accent)}
+button.send{background:var(--accent);border:none;color:#052e16;font-weight:700;border-radius:12px;
+  padding:0 22px;cursor:pointer;font-size:15px}
+button.send:disabled{opacity:.5;cursor:not-allowed}
+.ghost{background:transparent;border:1px solid var(--line);color:#e5e7eb;border-radius:10px;
+  padding:6px 11px;cursor:pointer;font-size:12px}
+.typing{opacity:.65}
+footer{text-align:center;font-size:12px;opacity:.55;padding:9px}
 </style>
 </head>
 <body>
 <div class="wrap">
 <header>
-<div><h1><span class="dot"></span>my-ai-agent</h1><p id="prov">הסוכן האישי שלך - מחובר ופעיל</p></div>
-<button class="clear" onclick="clearChat()">נקה צאט</button>
+  <h1><span class="dot" id="dot"></span>my-ai-agent</h1>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="badge" id="prov">טוען…</span>
+    <button class="ghost" onclick="reset()">ניקוי</button>
+  </div>
 </header>
-<div id="chat"></div>
+<div id="log"></div>
 <div class="examples">
-<button onclick="ask('עזרה')">עזרה</button>
-<button onclick="ask('מה השעה?')">מה השעה?</button>
-<button onclick="ask('חשב 12*8+5')">חשב 12*8+5</button>
-<button onclick="ask('כתוב לי בדיחה בעברית')">בדיחה</button>
+  <button onclick="ask('מה המזג בתל אביב?')">מזג</button>
+  <button onclick="ask('מי היה אלכסנדר פוסקין?')">פוסקין</button>
+  <button onclick="ask('חשב 12*8+5')">חישוב</button>
+  <button onclick="ask('זכור שאני מתכנן טיול ליפאן באוקטובר')">זיכרון</button>
+  <button onclick="ask('מה שמרת ממני?')">מה זכרת</button>
 </div>
 <form onsubmit="send(event)">
-<input id="inp" placeholder="כתוב הודעה לסוכן..." autocomplete="off">
-<button class="send" type="submit">שלח</button>
+  <input id="inp" placeholder="כתוב משימה לסוכן…" autocomplete="off" maxlength="8000">
+  <button class="send" id="btn" type="submit">שלח</button>
 </form>
-<footer>Groq + Gemini על Render - Frankfurt - Free Plan</footer>
+<footer id="foot">Render · Frankfurt · Free</footer>
 </div>
 <script>
+const log=document.getElementById('log'), inp=document.getElementById('inp'),
+      btn=document.getElementById('btn'), dot=document.getElementById('dot'),
+      provEl=document.getElementById('prov');
+let KEY=new URLSearchParams(location.search).get('key')||localStorage.getItem('agent_key')||'';
+const SID='s-'+Math.random().toString(36).slice(2,10);
 let history=[];
-const chat=document.getElementById('chat');
-const inp=document.getElementById('inp');
-fetch('/api/info').then(r=>r.json()).then(j=>{document.getElementById('prov').textContent='מחובר: '+j.provider;}).catch(()=>{});
-function addMsg(t,c){const d=document.createElement('div');d.className='msg '+c;d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;}
-addMsg('היי! אני הסוכן החכם שלך עם AI אמיתי. שאל אותי כל דבר בעברית.','bot');
-function ask(t){inp.value=t;send(new Event('submit'));}
-async function send(e){e.preventDefault();const text=inp.value.trim();if(!text)return;inp.value='';addMsg(text,'user');history.push({role:'user',content:text});const tp=addMsg('מקליד...','bot typing');try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:history})});const j=await r.json();tp.remove();addMsg(j.reply,'bot');history.push({role:'assistant',content:j.reply});}catch(err){tp.remove();addMsg('שגיאת חיבור לשרת. נסה שוב.','bot');}}
-function clearChat(){chat.innerHTML='';history=[];addMsg('הצאט נוקה. איך אפשר לעזור?','bot');}
+
+fetch('/api/info').then(r=>r.json()).then(j=>{
+  provEl.textContent=j.provider;
+  dot.classList.toggle('live', j.providers_available.length>0);
+  document.getElementById('foot').textContent =
+    'Render · Frankfurt · '+(j.providers_available.length?j.tools.length+' כלים פעילים':'ללא מפתח מודל');
+}).catch(()=>{provEl.textContent='שגיאת חיבור'});
+
+function add(t,c,extra){
+  const d=document.createElement('div');
+  d.className='msg '+c; d.textContent=t;
+  if(extra){const s=document.createElement('span');s.className='prov';s.textContent=extra;d.appendChild(s);}
+  log.appendChild(d); log.scrollTop=log.scrollHeight; return d;
+}
+function addSteps(node,steps){
+  if(!steps||!steps.length) return;
+  const s=document.createElement('div');
+  s.className='steps';
+  s.textContent='כלים: '+steps.map(x=>x.tool).join(', ');
+  node.appendChild(s);
+}
+add('היי! אני סוכן AI אוטונומי. אני יכול לחשב, לחפש בוויקיפדיה, לקרוא אתרים ולזכור עובדות ביניינו. מה לעשות?','bot');
+function ask(t){inp.value=t; send(new Event('submit'));}
+function reset(){log.innerHTML='';history=[];add('נוקה. מה לעשות עכשיו?','bot');}
+
+async function send(e){
+  e.preventDefault();
+  const text=inp.value.trim();
+  if(!text) return;
+  inp.value=''; add(text,'user');
+  history.push({role:'user',content:text});
+  const typing=add('מקליד…','bot typing');
+  btn.disabled=true;
+  const t0=performance.now();
+  try{
+    const headers={'Content-Type':'application/json'};
+    if(KEY) headers['X-API-Key']=KEY;
+    const r=await fetch('/api/chat',{method:'POST',headers,
+      body:JSON.stringify({message:text,sessionId:SID,history:history.slice(-10)})});
+    if(r.status===401){
+      const k=prompt('השרת דורש מפתח API. הדבק את הערך של AGENT_API_KEY:');
+      if(k){ localStorage.setItem('agent_key',k.trim()); location.search='?key='+encodeURIComponent(k.trim()); }
+      typing.className='msg err'; typing.textContent='נדרש מפתח API — הדבק אותו כדי להמשיך.';
+      return;
+    }
+    const j=await r.json();
+    typing.className='msg bot';
+    if(j.error && !j.answer){ typing.className='msg err'; typing.textContent=j.detail||j.error; }
+    else{
+      typing.textContent=j.answer||'אין תשובה.';
+      if(j.steps) addSteps(typing,j.steps);
+      const tag=j.provider+' · '+(j.duration_ms||Math.round(performance.now()-t0))+'ms'
+        +(j.used_tools?' · עם כלים':'');
+      const s=document.createElement('span'); s.className='prov'; s.textContent=tag; typing.appendChild(s);
+      history.push({role:'assistant',content:j.answer||''});
+    }
+  }catch(err){
+    typing.className='msg err'; typing.textContent='שגיאת חיבור לשרת. נסה שוב.';
+  }finally{
+    btn.disabled=false; typing.classList.remove('typing'); inp.focus();
+  }
+}
 </script>
 </body>
 </html>
