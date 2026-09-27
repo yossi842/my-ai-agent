@@ -145,6 +145,32 @@ def notes() -> dict:
     return {"notes": _load_notes()}
 
 
+@app.get("/api/models", dependencies=[Depends(require_key)])
+def models() -> dict:
+    """רשימת המודלים שהמפתח מורשה להשתמש בהם — לאבחון בעיות 403/404."""
+    import json as _json
+    from urllib.error import HTTPError
+    from urllib.request import Request as URLRequest, urlopen
+
+    out = []
+    for p in providers():
+        entry = {"provider": p["id"], "configured_model": p["model"], "available": [], "error": None}
+        try:
+            req = URLRequest(
+                p["base_url"].rstrip("/") + "/models",
+                headers={"Authorization": f"Bearer {p['api_key']}"},
+            )
+            with urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read().decode())
+            entry["available"] = sorted(m.get("id", "") for m in data.get("data", []))
+        except HTTPError as e:
+            entry["error"] = f"HTTP {e.code}"
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {e}"
+        out.append(entry)
+    return {"providers": out}
+
+
 @app.get("/api/history", dependencies=[Depends(require_key)])
 def history(sessionId: str = "default", limit: int = 20) -> dict:
     from agent import _load_history
